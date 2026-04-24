@@ -16,10 +16,22 @@ final class NukerRuntime {
     Vec3d positionAtLastMovement = Vec3d.ZERO;
     int timer;
 
-    void restartFullScan(int goalIndexExclusive, int cursorStart) {
+    void reset() {
+        workSet.clearAll();
+        fullScanCursor = 0;
+        fullScanJustReset = true;
+        lastLocalCursorExclusive = 0;
+        lastCrawlCursorExclusive = 0;
+        lastTickBestActionWorld = BlockPos.ORIGIN;
+        lastTickBestActionMapIndex = 0;
+        lastTickBestActionDistance = 0F;
+        positionAtLastMovement = Vec3d.ZERO;
+        timer = 0;
+    }
+
+    void restartFullScan(int cursorStart) {
         workSet.full.clear();
-        int goalMaxIndex = Math.max(goalIndexExclusive - 1, 0);
-        fullScanCursor = clamp(cursorStart, 0, goalMaxIndex);
+        fullScanCursor = Math.max(0, cursorStart);
         fullScanJustReset = true;
     }
 
@@ -29,11 +41,4 @@ final class NukerRuntime {
         return Math.max(1, (int) Math.ceil(distance));
     }
 
-    void clampAnchor(int goalIndexExclusive) {
-        lastTickBestActionMapIndex = clamp(lastTickBestActionMapIndex, 0, Math.max(goalIndexExclusive - 1, 0));
-    }
-
-    private static int clamp(int value, int min, int max) {
-        return Math.max(min, Math.min(max, value));
-    }
 }

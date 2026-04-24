@@ -148,6 +148,7 @@ public class OptimizedNuker extends Module {
     private final BlockPos.Mutable scanPos = new BlockPos.Mutable();
     private final BlockPos.Mutable metaNeighborPos = new BlockPos.Mutable();
     private ScanContext scanContext = ScanContext.EMPTY;
+    private final MiniHudSelectionState selectionState = new MiniHudSelectionState();
     private int metaDebugBudget;
     private String lastMetaDebugSummary = "";
 
@@ -171,17 +172,28 @@ public class OptimizedNuker extends Module {
     @Override
     public void onActivate() {
         runtime.workSet.ensureQueueCapacities(maxActionsPerTick.get(), maxFullQueueSize.get());
+        resetRuntimeState();
         metaDebugBudget = META_DEBUG_BUDGET_PER_TICK;
+
+        if (mc.player == null || mc.world == null) return;
+
+        reloadMetaShapeDraftFromSetting();
         refreshMap(true);
-        runtime.positionAtLastMovement = mc.player != null ? new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ()) : Vec3d.ZERO;
-        runtime.workSet.clearAll();
-        runtime.lastTickBestActionWorld = mc.player != null ? mc.player.getBlockPos() : BlockPos.ORIGIN;
-        runtime.lastTickBestActionDistance = 0;
+        runtime.positionAtLastMovement = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        runtime.lastTickBestActionWorld = mc.player.getBlockPos();
         scanContext = buildScanContext();
-        runtime.timer = 0;
-        runtime.lastLocalCursorExclusive = mapCache.goalIndexExclusive();
-        runtime.lastCrawlCursorExclusive = mapCache.goalIndexExclusive();
-        runtime.restartFullScan(mapCache.goalIndexExclusive(), 0);
+        resetScannerCursors();
+    }
+
+    @Override
+    public void onDeactivate() {
+        resetRuntimeState();
+    }
+
+    private void resetRuntimeState() {
+        runtime.reset();
+        scanContext = ScanContext.EMPTY;
+        lastMetaDebugSummary = "";
     }
 
     @Override
@@ -199,35 +211,49 @@ public class OptimizedNuker extends Module {
         table.add(theme.label("MiniHUD meta shapes")).expandX();
         table.row();
 
-        WButton refresh = table.add(theme.button("Refresh Meta Shapes / Reload Cache")).widget();
-        refresh.action = () -> {
+        List<MiniHudRegionApi.ShapeHandle> shapes = loadSortedMetaShapes();
+        selectionState.ensureDraftLoaded(selectedMetaShapes.get(), shapes);
+        selectionState.normalizeDraft(shapes);
+
+        WButton reloadShapes = table.add(theme.button("Reload Shapes From MiniHUD")).widget();
+        reloadShapes.action = () -> {
             MiniHudRegionApi.invalidateCache();
             initWidget(theme, table);
         };
 
-        WButton quickBlacklist = table.add(theme.button("Quick Blacklist")).widget();
-        quickBlacklist.action = this::applyQuickBlacklist;
-        table.row();
+        WButton applySelection = table.add(theme.button("Use Draft Selection")).widget();
+        applySelection.action = () -> applyMetaShapeDraft(theme, table);
 
-        Set<String> selected = getNormalizedSelectedMetaShapeTokens();
-        List<MiniHudRegionApi.ShapeHandle> shapes = new ArrayList<>(MiniHudRegionApi.listShapes());
-        shapes.sort(Comparator.comparing(shape -> shape.displayName, String.CASE_INSENSITIVE_ORDER));
+        boolean allSelected = selectionState.hasAllSelectable(shapes);
+        WButton toggleAll = table.add(theme.button(allSelected ? "Deselect All" : "Select All Supported")).widget();
+        toggleAll.action = () -> {
+            if (selectionState.hasAllSelectable(shapes)) selectionState.clearVisible(shapes);
+            else selectionState.setAllSelectable(shapes, true);
+            initWidget(theme, table);
+        };
+        table.row();
 
         if (shapes.isEmpty()) {
             String error = MiniHudRegionApi.getLastError();
             table.add(theme.label(error == null ? "No MiniHUD shapes were found." : "MiniHUD region API error: " + error)).expandX();
             table.row();
-            return;
+        } else {
+            for (MiniHudRegionApi.ShapeHandle snapshot : shapes) {
+                WCheckbox checkbox = table.add(theme.checkbox(selectionState.isSelected(snapshot))).widget();
+                checkbox.action = () -> selectionState.setSelected(snapshot, checkbox.checked);
+
+                String suffix = snapshot.supported ? (snapshot.enabled ? "" : " (disabled)") : " (unsupported: " + snapshot.typeId + ")";
+                table.add(theme.label(snapshot.displayName + suffix)).expandX();
+                table.row();
+            }
         }
 
-        for (MiniHudRegionApi.ShapeHandle snapshot : shapes) {
-            WCheckbox checkbox = table.add(theme.checkbox(isSelectedMetaShape(snapshot, selected))).widget();
-            checkbox.action = () -> updateSelectedMetaShape(snapshot, checkbox.checked);
+        table.add(theme.label("Block list utilities")).expandX();
+        table.row();
 
-            String suffix = snapshot.supported ? (snapshot.enabled ? "" : " (disabled)") : " (unsupported: " + snapshot.typeId + ")";
-            table.add(theme.label(snapshot.displayName + suffix)).expandX();
-            table.row();
-        }
+        WButton quickBlacklist = table.add(theme.button("Add Quick Blacklist Defaults")).widget();
+        quickBlacklist.action = this::applyQuickBlacklist;
+        table.row();
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
@@ -296,15 +322,22 @@ public class OptimizedNuker extends Module {
     }
 
     private void refreshMap(boolean force) {
+        if (mc.player == null || mc.world == null) return;
+
         int[] cubeExtents = currentCubeExtents();
         boolean changed = mapCache.rebuildIfNeeded(force, shape.get(), sortMode.get(), range.get(), cubeExtents, mc.player.getHorizontalFacing());
         if (!changed) return;
 
-        runtime.clampAnchor(mapCache.goalIndexExclusive());
+        runtime.lastTickBestActionMapIndex = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
         runtime.workSet.clearAll();
-        runtime.lastLocalCursorExclusive = mapCache.goalIndexExclusive();
-        runtime.lastCrawlCursorExclusive = mapCache.goalIndexExclusive();
-        runtime.restartFullScan(mapCache.goalIndexExclusive(), 0);
+        resetScannerCursors();
+    }
+
+    private void resetScannerCursors() {
+        int end = mapCache.candidateCount();
+        runtime.lastLocalCursorExclusive = end;
+        runtime.lastCrawlCursorExclusive = end;
+        runtime.restartFullScan(0);
     }
 
     private int[] currentCubeExtents() {
@@ -315,18 +348,18 @@ public class OptimizedNuker extends Module {
         runtime.positionAtLastMovement = now;
         runtime.workSet.clearAll();
         int rewind = countRewindIndicesForAnchor(runtime.fullScanCursor, movementBlocks);
-        runtime.restartFullScan(mapCache.goalIndexExclusive(), Math.max(0, runtime.fullScanCursor - rewind));
+        runtime.restartFullScan(mapCache.clampToCandidateIndex(Math.max(0, runtime.fullScanCursor - rewind)));
     }
 
     private void localScan(int movementBlocks, CandidatePolicy.Inputs policy) {
         runtime.workSet.local.clear();
-        if (mapCache.activeMap().length == 0 || mapCache.goalIndexExclusive() <= 0) {
+        if (!mapCache.hasCandidates()) {
             runtime.lastLocalCursorExclusive = 0;
             return;
         }
 
         int index = computeRetractedAnchorIndex(movementBlocks);
-        int goal = mapCache.goalIndexExclusive();
+        int goal = mapCache.candidateCount();
         while (index < goal && !runtime.workSet.local.isFull()) {
             scanQueueIndex(index, runtime.workSet.local, policy);
             index++;
@@ -336,13 +369,13 @@ public class OptimizedNuker extends Module {
 
     private void crawlScan(CandidatePolicy.Inputs policy) {
         runtime.workSet.crawl.clear();
-        if (mapCache.activeMap().length == 0 || mapCache.goalIndexExclusive() <= 0) {
+        if (!mapCache.hasCandidates()) {
             runtime.lastCrawlCursorExclusive = 0;
             return;
         }
 
-        int index = clamp(runtime.lastTickBestActionMapIndex, 0, Math.max(mapCache.goalIndexExclusive() - 1, 0));
-        int goal = mapCache.goalIndexExclusive();
+        int index = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
+        int goal = mapCache.candidateCount();
         while (index < goal && !runtime.workSet.crawl.isFull()) {
             scanQueueIndex(index, runtime.workSet.crawl, policy);
             index++;
@@ -351,14 +384,14 @@ public class OptimizedNuker extends Module {
     }
 
     private int computeLocalSearchBudget(int movementBlocks) {
-        if (mapCache.activeMap().length == 0 || mapCache.goalIndexExclusive() <= 0) return 0;
+        if (!mapCache.hasCandidates()) return 0;
         int rewind = countRewindIndicesForAnchor(runtime.lastTickBestActionMapIndex, movementBlocks);
         int budget = Math.max(maxActionsPerTick.get(), rewind + maxActionsPerTick.get());
-        return clamp(budget, 1, mapCache.goalIndexExclusive());
+        return clamp(budget, 1, mapCache.candidateCount());
     }
 
     private int computeRetractedAnchorIndex(int movementBlocks) {
-        int anchor = clamp(runtime.lastTickBestActionMapIndex, 0, Math.max(mapCache.goalIndexExclusive() - 1, 0));
+        int anchor = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
         int rewind = countRewindIndicesForAnchor(anchor, movementBlocks);
         int retracted = anchor - rewind;
         int budget = computeLocalSearchBudget(movementBlocks);
@@ -367,14 +400,16 @@ public class OptimizedNuker extends Module {
     }
 
     private int countRewindIndicesForAnchor(int anchorIndex, int movementBlocks) {
-        if (mapCache.activeMap().length == 0 || mapCache.goalIndexExclusive() <= 0) return 0;
+        if (!mapCache.hasCandidates()) return 0;
 
         int blocks = Math.max(1, movementBlocks);
         if (shape.get() == Shape.Sphere) {
-            int clampedIndex = clamp(anchorIndex, 0, Math.max(mapCache.goalIndexExclusive() - 1, 0));
-            int anchorShell = clamp((int) Math.floor(mapCache.activeMap()[clampedIndex].distance), 0, SphereMapStore.MAX_RADIUS);
-            int startShell = clamp(anchorShell - blocks, 0, SphereMapStore.MAX_RADIUS);
-            return Math.max(1, SphereMapStore.voxelsBetweenIntegerDistances(startShell, anchorShell));
+            int clampedIndex = mapCache.clampToCandidateIndex(anchorIndex);
+            int anchorShell = clamp((int) Math.floor(mapCache.pointAt(clampedIndex).distance), 0, SphereMapStore.MAX_RADIUS);
+            int otherShell = sortMode.get() == SortMode.Furthest
+                ? clamp(anchorShell + blocks, 0, SphereMapStore.MAX_RADIUS)
+                : clamp(anchorShell - blocks, 0, SphereMapStore.MAX_RADIUS);
+            return Math.max(1, SphereMapStore.voxelsBetweenIntegerDistances(otherShell, anchorShell));
         }
 
         return Math.max(1, blocks * 64);
@@ -382,26 +417,96 @@ public class OptimizedNuker extends Module {
 
     private int computeFullWrapExclusive() {
         int wrapExclusive = Math.max(runtime.lastLocalCursorExclusive, runtime.lastCrawlCursorExclusive);
-        if (wrapExclusive <= 0) wrapExclusive = mapCache.goalIndexExclusive();
-        return clamp(wrapExclusive, 0, mapCache.goalIndexExclusive());
+        int maxExclusive = mapCache.candidateCount();
+        if (wrapExclusive <= 0) wrapExclusive = maxExclusive;
+        return clamp(wrapExclusive, 0, maxExclusive);
     }
 
     private void fullScan(CandidatePolicy.Inputs policy) {
-        if (mapCache.activeMap().length == 0 || mapCache.goalIndexExclusive() <= 0) return;
+        if (!mapCache.hasCandidates()) return;
         if (runtime.workSet.full.isFull()) return;
 
         int wrapExclusive = computeFullWrapExclusive();
         if (wrapExclusive <= 0) return;
 
         int checksRemaining = runtime.fullScanJustReset ? Math.max(fullScanScansPerTick.get(), maxFullScanScansPerTick.get()) : fullScanScansPerTick.get();
+        boolean justReset = runtime.fullScanJustReset;
         runtime.fullScanJustReset = false;
 
+        if (justReset && shouldUsePriorityBootstrapSearch()) {
+            checksRemaining = priorityBootstrapScan(policy, checksRemaining, wrapExclusive);
+        }
+
         while (checksRemaining > 0 && !runtime.workSet.full.isFull()) {
-            if (runtime.fullScanCursor >= wrapExclusive) runtime.fullScanCursor = 0;
-            scanQueueIndex(runtime.fullScanCursor, runtime.workSet.full, policy);
-            runtime.fullScanCursor++;
+            int scanIndex = nextFullScanIndex(wrapExclusive);
+            if (scanIndex < 0) return;
+
+            scanQueueIndex(scanIndex, runtime.workSet.full, policy);
+            runtime.fullScanCursor = scanIndex + 1;
             checksRemaining--;
         }
+    }
+
+    private int nextFullScanIndex(int wrapExclusive) {
+        int scanIndex = runtime.fullScanCursor;
+        if (0 <= scanIndex && scanIndex < wrapExclusive) return scanIndex;
+        return wrapExclusive > 0 ? 0 : -1;
+    }
+
+    private boolean shouldUsePriorityBootstrapSearch() {
+        return shape.get() == Shape.Sphere && (sortMode.get() == SortMode.Closest || sortMode.get() == SortMode.Furthest);
+    }
+
+    private int priorityBootstrapScan(CandidatePolicy.Inputs policy, int checksRemaining, int wrapExclusive) {
+        int start = 0;
+        int upperExclusive = Math.min(wrapExclusive, mapCache.candidateCount());
+        if (upperExclusive <= 0 || checksRemaining <= 0) return checksRemaining;
+        while (checksRemaining > 0 && !runtime.workSet.full.isFull()) {
+            int span = upperExclusive - start;
+            if (span <= Math.max(5, maxActionsPerTick.get())) break;
+
+            int stride = smallestWrapAlignedStepAboveTenPercent(span);
+            boolean found = false;
+            int scansThisPass = Math.min(span, checksRemaining);
+
+            for (int phase = 0; phase < scansThisPass && !runtime.workSet.full.isFull(); phase++) {
+                int candidate = start + (int) (((long) phase * stride) % span);
+                if (candidate >= upperExclusive) continue;
+
+                checksRemaining--;
+                if (scanQueueIndex(candidate, runtime.workSet.full, policy)) {
+                    upperExclusive = candidate + 1;
+                    runtime.fullScanCursor = start;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) break;
+        }
+
+        return checksRemaining;
+    }
+
+    /**
+     * Pick a modular stride for a bounded priority window of span candidates.
+     *
+     * The stride is a factor of the highest relative index, span - 1, not just
+     * a generic coprime step. That guarantees the first outward run reaches
+     * span - 1; after that wrap, the next relative index is stride - 1, so
+     * each wrap begins one index earlier while preserving full coverage over
+     * the window.
+     */
+    private static int smallestWrapAlignedStepAboveTenPercent(int span) {
+        if (span <= 2) return 1;
+
+        int lastRelativeIndex = span - 1;
+        int threshold = Math.max(1, lastRelativeIndex / 10);
+        for (int step = threshold + 1; step <= lastRelativeIndex; step++) {
+            if (lastRelativeIndex % step == 0) return step;
+        }
+
+        return lastRelativeIndex;
     }
 
     private int modifyBlocks(CandidatePolicy.Inputs policy) {
@@ -434,8 +539,9 @@ public class OptimizedNuker extends Module {
     }
 
     private boolean tryExecuteQueuedAction(NukerActionQueue.View view, CandidatePolicy.Inputs policy) {
-        SphereMapStore.MapPoint[] activeMap = mapCache.activeMap();
-        if (view.mapIndex < 0 || view.mapIndex >= activeMap.length) return false;
+        if (!mapCache.isCandidateIndex(view.mapIndex)) return false;
+        SphereMapStore.MapPoint point = mapCache.pointAt(view.mapIndex);
+        if (point == null) return false;
         if (debugMetaRegion.get() && scanContext.hasSelectedShapes) {
             boolean inside = scanContext.regions.contains(view.pos);
             boolean shell = scanContext.regions.isShell(view.pos, metaNeighborPos);
@@ -443,7 +549,7 @@ public class OptimizedNuker extends Module {
             debugMeta("EXEC try type={} pos={} idx={} inside={} shell={} exterior={} invert={} useLimit={}",
                 actionTypeName(view.type), view.pos.toShortString(), view.mapIndex, inside, shell, exterior, invertMetaRegion.get(), scanContext.useMetaRegionLimit);
         }
-        if (!CandidatePolicy.revalidate(view.pos, activeMap[view.mapIndex], view.type, policy, metaNeighborPos)) {
+        if (!CandidatePolicy.revalidate(view.pos, point, view.type, policy, metaNeighborPos)) {
             debugMeta("EXEC rejected type={} pos={} idx={} reason=revalidate_failed", actionTypeName(view.type), view.pos.toShortString(), view.mapIndex);
             return false;
         }
@@ -483,16 +589,17 @@ public class OptimizedNuker extends Module {
         return true;
     }
 
-    private void scanQueueIndex(int mapIndex, NukerActionQueue queue, CandidatePolicy.Inputs policy) {
-        if (queue.isFull()) return;
-        if (mapIndex < 0 || mapIndex >= mapCache.activeMap().length) return;
+    private boolean scanQueueIndex(int mapIndex, NukerActionQueue queue, CandidatePolicy.Inputs policy) {
+        if (queue.isFull() || !mapCache.isCandidateIndex(mapIndex)) return false;
 
-        SphereMapStore.MapPoint point = mapCache.activeMap()[mapIndex];
+        SphereMapStore.MapPoint point = mapCache.pointAt(mapIndex);
+        if (point == null) return false;
         scanPos.set(mc.player.getX() + point.dx, mc.player.getY() + point.dy, mc.player.getZ() + point.dz);
         byte type = CandidatePolicy.classify(scanPos, point, policy, metaNeighborPos);
-        if (type != CandidatePolicy.NONE) {
-            queue.insertSorted(scanPos.asLong(), mapIndex, point.distance, type);
-        }
+        if (type == CandidatePolicy.NONE) return false;
+
+        queue.insertSorted(scanPos.asLong(), mapIndex, point.distance, type);
+        return true;
     }
 
     private FindItemResult findPlacementBlock(List<Block> allowed) {
@@ -567,6 +674,31 @@ public class OptimizedNuker extends Module {
         }
     }
 
+    private List<MiniHudRegionApi.ShapeHandle> loadSortedMetaShapes() {
+        List<MiniHudRegionApi.ShapeHandle> shapes = new ArrayList<>(MiniHudRegionApi.listShapes());
+        shapes.sort(Comparator.comparing(shape -> shape.displayName, String.CASE_INSENSITIVE_ORDER));
+        return shapes;
+    }
+
+    private void reloadMetaShapeDraftFromSetting() {
+        selectionState.reloadDraftFromStored(selectedMetaShapes.get(), loadSortedMetaShapes());
+    }
+
+    private void applyMetaShapeDraft(GuiTheme theme, WTable table) {
+        selectedMetaShapes.set(selectionState.draftSelectionString());
+        MiniHudRegionApi.invalidateCache();
+        lastMetaDebugSummary = "";
+
+        if (Utils.canUpdate()) {
+            scanContext = buildScanContext();
+            runtime.workSet.clearAll();
+            resetScannerCursors();
+        }
+
+        initWidget(theme, table);
+        info("Applied MiniHUD shape selection.");
+    }
+
     private void applyQuickBlacklist() {
         LinkedHashSet<Block> merged = new LinkedHashSet<>(blacklist.get());
         merged.addAll(QUICK_BLACKLIST);
@@ -575,48 +707,20 @@ public class OptimizedNuker extends Module {
     }
 
     private Set<String> getSelectedMetaShapeTokens() {
-        String raw = selectedMetaShapes.get();
-        Set<String> out = new LinkedHashSet<>();
-        if (raw == null || raw.isBlank()) return out;
-        for (String part : raw.split("\\|")) {
-            String trimmed = part.trim();
-            if (!trimmed.isEmpty()) out.add(trimmed);
-        }
-        return out;
+        return selectionState.storedSelectionTokens(selectedMetaShapes.get());
     }
 
     private Set<String> getNormalizedSelectedMetaShapeTokens() {
         Set<String> stored = getSelectedMetaShapeTokens();
         if (stored.isEmpty()) return stored;
 
-        List<MiniHudRegionApi.ShapeHandle> shapes = MiniHudRegionApi.listShapes();
+        List<MiniHudRegionApi.ShapeHandle> shapes = loadSortedMetaShapes();
         if (shapes.isEmpty()) return stored;
 
-        LinkedHashSet<String> normalized = new LinkedHashSet<>();
-        for (MiniHudRegionApi.ShapeHandle handle : shapes) {
-            if (stored.contains(handle.selectionKey) || stored.contains(handle.displayName)) {
-                normalized.add(handle.displayName);
-            }
-        }
-
-        if (!normalized.equals(stored)) {
-            selectedMetaShapes.set(String.join("|", normalized));
-        }
-
+        LinkedHashSet<String> normalized = selectionState.normalizedStoredSelection(selectedMetaShapes.get(), shapes);
+        String normalizedString = String.join("|", normalized);
+        if (!normalizedString.equals(selectedMetaShapes.get())) selectedMetaShapes.set(normalizedString);
         return normalized;
-    }
-
-    private boolean isSelectedMetaShape(MiniHudRegionApi.ShapeHandle handle, Set<String> selectedTokens) {
-        return selectedTokens.contains(handle.displayName) || selectedTokens.contains(handle.selectionKey);
-    }
-
-    private void updateSelectedMetaShape(MiniHudRegionApi.ShapeHandle handle, boolean selected) {
-        Set<String> tokens = new LinkedHashSet<>(getNormalizedSelectedMetaShapeTokens());
-        tokens.remove(handle.selectionKey);
-        tokens.remove(handle.displayName);
-
-        if (selected) tokens.add(handle.displayName);
-        selectedMetaShapes.set(String.join("|", tokens));
     }
 
     private void logMetaContextIfChanged() {

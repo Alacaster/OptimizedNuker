@@ -8,20 +8,45 @@ import java.util.Comparator;
 import java.util.List;
 
 final class NukerMapCache {
+    private static final int[] EMPTY_WINDOWS = new int[0];
+
     private SphereMapStore.MapPoint[] activeMap = new SphereMapStore.MapPoint[0];
-    private int goalIndexExclusive;
+    private int[] scanWindowStarts = EMPTY_WINDOWS;
+    private int[] scanWindowEnds = EMPTY_WINDOWS;
+    private int[] scanWindowCandidateStarts = EMPTY_WINDOWS;
+    private int candidateCount;
     private OptimizedNuker.Shape cachedShape;
     private OptimizedNuker.SortMode cachedSortMode;
     private Direction cachedFacing;
     private double cachedRange;
     private int[] cachedCubeExtents = new int[6];
 
-    SphereMapStore.MapPoint[] activeMap() {
-        return activeMap;
+    boolean hasCandidates() {
+        return candidateCount > 0;
     }
 
-    int goalIndexExclusive() {
-        return goalIndexExclusive;
+    int candidateCount() {
+        return candidateCount;
+    }
+
+    boolean isCandidateIndex(int index) {
+        return 0 <= index && index < candidateCount;
+    }
+
+    int clampToCandidateIndex(int index) {
+        if (!hasCandidates()) return 0;
+        return clamp(index, 0, candidateCount - 1);
+    }
+
+    SphereMapStore.MapPoint pointAt(int candidateIndex) {
+        int rawIndex = rawIndexAt(candidateIndex);
+        return rawIndex < 0 ? null : activeMap[rawIndex];
+    }
+
+    int rawIndexAt(int candidateIndex) {
+        if (!isCandidateIndex(candidateIndex)) return -1;
+        int window = windowForCandidateIndex(candidateIndex);
+        return scanWindowStarts[window] + candidateIndex - scanWindowCandidateStarts[window];
     }
 
     boolean rebuildIfNeeded(boolean force, OptimizedNuker.Shape shape, OptimizedNuker.SortMode sortMode, double range, int[] cubeExtents, Direction facing) {
@@ -52,16 +77,127 @@ final class NukerMapCache {
             case Cube -> activeMap = generateDirectionalCubeMap(sortMode, facing, cubeExtents);
         }
 
-        goalIndexExclusive = computeGoalIndexExclusive(shape, sortMode, range);
+        rebuildScanWindows(shape, sortMode, range);
         return true;
     }
 
-    private int computeGoalIndexExclusive(OptimizedNuker.Shape shape, OptimizedNuker.SortMode sortMode, double range) {
-        if (activeMap.length == 0) return 0;
-        if (shape == OptimizedNuker.Shape.Sphere && sortMode == OptimizedNuker.SortMode.Closest) {
-            return SphereMapStore.upperBoundByDistance(SphereMapStore.closest(), (float) Math.min(range, SphereMapStore.MAX_RADIUS));
+    private void rebuildScanWindows(OptimizedNuker.Shape shape, OptimizedNuker.SortMode sortMode, double range) {
+        if (activeMap.length == 0) {
+            setEmptyScanWindows();
+            return;
         }
-        return activeMap.length;
+
+        if (shape != OptimizedNuker.Shape.Sphere) {
+            setSingleScanWindow(0, activeMap.length);
+            return;
+        }
+
+        float maxDistance = (float) Math.min(Math.max(range, 0), SphereMapStore.MAX_RADIUS);
+        switch (sortMode) {
+            case Closest -> setDistanceOrderedScanWindow(maxDistance, true);
+            case Furthest -> setDistanceOrderedScanWindow(maxDistance, false);
+            case TopDown -> setContiguousRangeScanWindows(maxDistance);
+        }
+    }
+
+    private void setDistanceOrderedScanWindow(float maxDistance, boolean nearestFirst) {
+        int split = findDistanceSplit(activeMap, maxDistance, nearestFirst);
+        if (nearestFirst) setSingleScanWindow(0, split);
+        else setSingleScanWindow(split, activeMap.length);
+    }
+
+    private static int findDistanceSplit(SphereMapStore.MapPoint[] map, float maxDistance, boolean nearestFirst) {
+        int lo = 0;
+        int hi = map.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            boolean beforeCandidateWindow = nearestFirst
+                ? map[mid].distance <= maxDistance
+                : map[mid].distance > maxDistance;
+            if (beforeCandidateWindow) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    private void setContiguousRangeScanWindows(float maxDistance) {
+        List<Integer> starts = new ArrayList<>();
+        List<Integer> ends = new ArrayList<>();
+        int start = -1;
+
+        for (int i = 0; i < activeMap.length; i++) {
+            boolean inRange = activeMap[i].distance <= maxDistance;
+            if (inRange && start < 0) start = i;
+            else if (!inRange && start >= 0) {
+                starts.add(start);
+                ends.add(i);
+                start = -1;
+            }
+        }
+
+        if (start >= 0) {
+            starts.add(start);
+            ends.add(activeMap.length);
+        }
+
+        setScanWindows(starts, ends);
+    }
+
+    private void setSingleScanWindow(int start, int end) {
+        int clampedStart = clamp(start, 0, activeMap.length);
+        int clampedEnd = clamp(end, clampedStart, activeMap.length);
+        if (clampedStart >= clampedEnd) {
+            setEmptyScanWindows();
+            return;
+        }
+
+        scanWindowStarts = new int[]{clampedStart};
+        scanWindowEnds = new int[]{clampedEnd};
+        scanWindowCandidateStarts = new int[]{0};
+        candidateCount = clampedEnd - clampedStart;
+    }
+
+    private void setScanWindows(List<Integer> starts, List<Integer> ends) {
+        if (starts.isEmpty()) {
+            setEmptyScanWindows();
+            return;
+        }
+
+        scanWindowStarts = new int[starts.size()];
+        scanWindowEnds = new int[ends.size()];
+        scanWindowCandidateStarts = new int[starts.size()];
+        candidateCount = 0;
+        for (int i = 0; i < starts.size(); i++) {
+            scanWindowStarts[i] = starts.get(i);
+            scanWindowEnds[i] = ends.get(i);
+            scanWindowCandidateStarts[i] = candidateCount;
+            candidateCount += scanWindowEnds[i] - scanWindowStarts[i];
+        }
+    }
+
+    private void setEmptyScanWindows() {
+        scanWindowStarts = EMPTY_WINDOWS;
+        scanWindowEnds = EMPTY_WINDOWS;
+        scanWindowCandidateStarts = EMPTY_WINDOWS;
+        candidateCount = 0;
+    }
+
+    private int windowForCandidateIndex(int candidateIndex) {
+        int lo = 0;
+        int hi = scanWindowCandidateStarts.length - 1;
+        int best = 0;
+
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (scanWindowCandidateStarts[mid] <= candidateIndex) {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        return best;
     }
 
     private SphereMapStore.MapPoint[] generateUniformCubeMap(int r, OptimizedNuker.SortMode mode) {
@@ -126,5 +262,9 @@ final class NukerMapCache {
                 .thenComparingInt((SphereMapStore.MapPoint p) -> -p.dx)
                 .thenComparingInt((SphereMapStore.MapPoint p) -> -p.dz);
         };
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 }

@@ -46,17 +46,6 @@ final class SphereMapStore {
         return distancePrefixCounts[b] - distancePrefixCounts[a - 1];
     }
 
-    static int upperBoundByDistance(MapPoint[] map, float maxDistance) {
-        int lo = 0;
-        int hi = map.length;
-        while (lo < hi) {
-            int mid = (lo + hi) >>> 1;
-            if (map[mid].distance <= maxDistance) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo;
-    }
-
     private static MapPoint[] load(String resourcePath) throws IOException {
         byte[] bytes;
         try (InputStream in = SphereMapStore.class.getClassLoader().getResourceAsStream(resourcePath)) {

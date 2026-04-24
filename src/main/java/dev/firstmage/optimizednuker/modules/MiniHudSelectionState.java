@@ -1,6 +1,5 @@
 package dev.firstmage.optimizednuker.modules;
 
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -10,22 +9,22 @@ final class MiniHudSelectionState {
     private boolean draftLoaded;
 
     void ensureDraftLoaded(String rawStoredSelection, List<MiniHudRegionApi.ShapeHandle> shapes) {
-        if (!draftLoaded) {
-            reloadDraftFromStored(rawStoredSelection, shapes);
-        }
+        if (!draftLoaded) reloadDraftFromStored(rawStoredSelection, shapes);
     }
 
     void reloadDraftFromStored(String rawStoredSelection, List<MiniHudRegionApi.ShapeHandle> shapes) {
         draftTokens.clear();
-        draftTokens.addAll(normalizeTokens(parseStoredTokens(rawStoredSelection), shapes));
+        Set<String> stored = parseStoredTokens(rawStoredSelection);
+        draftTokens.addAll(shapes.isEmpty() ? stored : normalizeTokens(stored, shapes));
         draftLoaded = true;
     }
 
     void normalizeDraft(List<MiniHudRegionApi.ShapeHandle> shapes) {
-        if (!draftLoaded) return;
-        LinkedHashSet<String> copy = new LinkedHashSet<>(draftTokens);
+        if (!draftLoaded || shapes.isEmpty()) return;
+
+        LinkedHashSet<String> normalized = normalizeTokens(draftTokens, shapes);
         draftTokens.clear();
-        draftTokens.addAll(normalizeTokens(copy, shapes));
+        draftTokens.addAll(normalized);
     }
 
     boolean hasAllSelectable(List<MiniHudRegionApi.ShapeHandle> shapes) {
@@ -33,7 +32,7 @@ final class MiniHudSelectionState {
         for (MiniHudRegionApi.ShapeHandle handle : shapes) {
             if (!handle.supported) continue;
             anySelectable = true;
-            if (!draftTokens.contains(handle.displayName)) return false;
+            if (!draftTokens.contains(handle.selectionKey) && !draftTokens.contains(handle.displayName)) return false;
         }
         return anySelectable;
     }
@@ -45,14 +44,20 @@ final class MiniHudSelectionState {
         }
     }
 
+    void clearVisible(List<MiniHudRegionApi.ShapeHandle> shapes) {
+        for (MiniHudRegionApi.ShapeHandle handle : shapes) {
+            setSelected(handle, false);
+        }
+    }
+
     void setSelected(MiniHudRegionApi.ShapeHandle handle, boolean selected) {
         draftTokens.remove(handle.selectionKey);
         draftTokens.remove(handle.displayName);
-        if (selected) draftTokens.add(handle.displayName);
+        if (selected) draftTokens.add(handle.selectionKey);
     }
 
     boolean isSelected(MiniHudRegionApi.ShapeHandle handle) {
-        return draftTokens.contains(handle.displayName) || draftTokens.contains(handle.selectionKey);
+        return draftTokens.contains(handle.selectionKey) || draftTokens.contains(handle.displayName);
     }
 
     String draftSelectionString() {
@@ -81,7 +86,7 @@ final class MiniHudSelectionState {
         LinkedHashSet<String> normalized = new LinkedHashSet<>();
         for (MiniHudRegionApi.ShapeHandle handle : shapes) {
             if (tokens.contains(handle.selectionKey) || tokens.contains(handle.displayName)) {
-                normalized.add(handle.displayName);
+                normalized.add(handle.selectionKey);
             }
         }
         return normalized;
