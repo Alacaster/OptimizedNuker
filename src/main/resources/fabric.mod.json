@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "optimized-nuker",
+  "version": "${version}",
+  "name": "Optimized Nuker",
+  "description": "A map-driven Meteor addon focused on optimized large-radius nuking.",
+  "authors": [
+    "FirstMage"
+  ],
+  "contact": {},
+  "icon": "assets/optimizednuker/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "dev.firstmage.optimizednuker.OptimizedNukerAddon"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "225,25,25",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": [
+      "${mc_version}"
+    ],
+    "meteor-client": "*"
+  }
+}

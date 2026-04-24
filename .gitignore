@@ -1,0 +1,106 @@
+# Build outputs
+build/
+out/
+target/
+bin/
+*.class
+*.jar
+*.war
+*.ear
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle/wrapper/gradle-wrapper.jar
+
+# Maven
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+# IDE/editor
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs/crash reports
+logs/
+*.log
+hs_err_pid*
+replay_pid*
+crash-reports/
+
+# Minecraft run/client/server generated files
+run/
+runs/
+.minecraft/
+saves/
+world/
+worlds/
+server.properties
+eula.txt
+ops.json
+whitelist.json
+banned-players.json
+banned-ips.json
+usercache.json
+usernamecache.json
+session.lock
+
+# Mod loader generated/cache files
+mods/
+config/
+defaultconfigs/
+kubejs/
+local/
+cache/
+caches/
+.toml.bak
+*.bak
+
+# Loom/Fabric/Forge/Architectury generated
+.remapped/
+loom-cache/
+loom.mappings.*
+*.launch
+generated/
+
+# Secrets/tokens
+*.env
+.env
+.env.*
+secrets.*
+tokens.*
+credentials.*
+
+# Archives/packages
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.cache
