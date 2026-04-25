@@ -1,6 +1,6 @@
 # Optimized Nuker
 
-A Meteor Client addon by FirstMage focused on map-driven large-radius nuking, queue-based scanning, MiniHUD shape integration, line placement, and liquid filling.
+A Meteor Client addon that does map-driven large-radius nuking, MiniHUD shape integration, shell placing, and liquid filling.
 
 ## Project identity
 
