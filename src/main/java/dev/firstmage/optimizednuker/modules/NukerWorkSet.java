@@ -1,36 +1,46 @@
 package dev.firstmage.optimizednuker.modules;
 
+/**
+ * Owns the two crawl queues and the reusable views used by produce/consume sites.
+ * Low-side work is consumed before high-side fallback work.
+ */
 final class NukerWorkSet {
-    NukerActionQueue crawl = new NukerActionQueue(1);
-    NukerActionQueue local = new NukerActionQueue(1);
-    NukerActionQueue full = new NukerActionQueue(1);
+    NukerActionQueue crawlHigh = new NukerActionQueue(1);
+    NukerActionQueue crawlLow = new NukerActionQueue(1);
 
     final NukerActionQueue.View crawlHeadView = new NukerActionQueue.View();
-    final NukerActionQueue.View localHeadView = new NukerActionQueue.View();
-    final NukerActionQueue.View fullHeadView = new NukerActionQueue.View();
     final NukerActionQueue.View actionView = new NukerActionQueue.View();
 
-    void ensureQueueCapacities(int workerCapacity, int fullCapacity) {
-        int worker = Math.max(1, workerCapacity);
-        int fullCap = Math.max(1, fullCapacity);
-        if (crawl.capacity() != worker) crawl = new NukerActionQueue(worker);
-        if (local.capacity() != worker) local = new NukerActionQueue(worker);
-        if (full.capacity() != fullCap) full = new NukerActionQueue(fullCap);
+    void ensureQueueCapacities(int actionCapacity) {
+        int perQueueCapacity = Math.max(1, actionCapacity);
+        if (crawlHigh.capacity() != perQueueCapacity) crawlHigh = new NukerActionQueue(perQueueCapacity);
+        if (crawlLow.capacity() != perQueueCapacity) crawlLow = new NukerActionQueue(perQueueCapacity);
     }
 
-
-    boolean popNextByPriorityInto(NukerActionQueue.View out) {
-        return full.popFirstInto(out) || local.popFirstInto(out) || crawl.popFirstInto(out);
+    boolean popNextCrawlActionInto(NukerActionQueue.View out) {
+        if (crawlLow.popLastInto(out)) return true;
+        return crawlHigh.popFirstInto(out);
     }
 
-    void clearAll() {
-        crawl.clear();
-        local.clear();
-        full.clear();
+    boolean peekNextCrawlActionInto(NukerActionQueue.View out) {
+        if (crawlLow.peekLastInto(out)) return true;
+        return crawlHigh.peekFirstInto(out);
     }
 
-    void clearWorkers() {
-        crawl.clear();
-        local.clear();
+    int queuedActionCount() {
+        return crawlHigh.size() + crawlLow.size();
+    }
+
+    boolean hasQueuedActions() {
+        return !crawlHigh.isEmpty() || !crawlLow.isEmpty();
+    }
+
+    boolean queuesFull() {
+        return crawlHigh.isFull() && crawlLow.isFull();
+    }
+
+    void clearQueues() {
+        crawlHigh.clear();
+        crawlLow.clear();
     }
 }

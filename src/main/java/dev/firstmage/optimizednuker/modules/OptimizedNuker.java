@@ -3,6 +3,7 @@ package dev.firstmage.optimizednuker.modules;
 import meteordevelopment.meteorclient.events.entity.player.BlockBreakingCooldownEvent;
 import meteordevelopment.meteorclient.events.meteor.KeyEvent;
 import meteordevelopment.meteorclient.events.meteor.MouseClickEvent;
+import meteordevelopment.meteorclient.events.render.Render2DEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.gui.GuiTheme;
@@ -27,31 +28,57 @@ import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.item.BlockItem;
 import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.hit.HitResult;
-import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Map-driven nuker module.
+ *
+ * Each tick has three phases with disjoint state ownership:
+ *
+ *   observe   refreshes the map cache, populates {@link CandidatePolicy.Inputs} and
+ *             {@link ScanContext}, and rebases the frontier on player movement.
+ *   scan/modify loop  alternates {@link NukerScanners#runCrawl} (which produces
+ *             actions and dispatches the completion probe internally) with
+ *             {@link NukerScanners#runFullScan} (which relocates the frontier when
+ *             crawl produces nothing). Each pass through the loop that produces
+ *             actions runs {@link #runModify} to consume them.
+ *   finalize  resets the cooldown timer when actions were performed, clears the
+ *             work set, and emits a profiler tick boundary.
+ *
+ * Single-classify: candidates are classified once at produce time. {@link #runModify}
+ * trusts the queued type and relies on {@code BlockUtils.canBreak}/{@code place}
+ * gates to handle any stale targets. The frontier advances only on a successful
+ * action, so failures don't cause the next tick to skip past unfinished work.
+ */
 public class OptimizedNuker extends Module {
     private static final Logger LOG = LoggerFactory.getLogger("OptimizedNuker");
     private static final int META_DEBUG_BUDGET_PER_TICK = 32;
+
+    /**
+     * Per-call hard cap on crawl classifies. Bounded high enough that crawl can
+     * fill its queues from a fresh anchor in one call under normal conditions,
+     * but low enough that a pathological all-rejecting sweep can't lock the tick.
+     */
+    private static final int CRAWL_MAX_SCANS_PER_CALL = 4096;
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgMeta = settings.createGroup("Meta");
@@ -99,10 +126,8 @@ public class OptimizedNuker extends Module {
 
     private final Setting<Integer> delay = sgGeneral.add(new IntSetting.Builder().name("delay").description("Delay in ticks between successful action batches.").defaultValue(0).min(0).build());
     private final Setting<Integer> maxActionsPerTick = sgGeneral.add(new IntSetting.Builder().name("max-actions-per-tick").description("Maximum successful actions to perform per tick.").defaultValue(1).min(1).build());
-    private final Setting<Integer> fullScanScansPerTick = sgGeneral.add(new IntSetting.Builder().name("full-scan-scans-per-tick").description("Normal number of full-scan checks to do per tick.").defaultValue(64).min(1).build());
-    private final Setting<Integer> maxFullScanScansPerTick = sgGeneral.add(new IntSetting.Builder().name("max-full-scan-scans-per-tick").description("Maximum number of full-scan checks to do in a tick right after a full-scan reset.").defaultValue(512).min(1).build());
-    private final Setting<Integer> maxFullQueueSize = sgGeneral.add(new IntSetting.Builder().name("max-full-queue-size").description("Pause full scanning when the full queue already has this many actions buffered.").defaultValue(512).min(1).build());
-
+    private final Setting<Integer> probeGlobalFrontierScansPerTick = sgGeneral.add(new IntSetting.Builder().name("full-scan-scans-per-tick").description("Base full-scan budget per tick.").defaultValue(64).min(1).build());
+    private final Setting<Integer> maxGlobalFrontierProbeScansPerTick = sgGeneral.add(new IntSetting.Builder().name("max-full-scan-scans-per-tick").description("Maximum full-scan scans per tick (base + bonus).").defaultValue(512).min(1).build());
     private final Setting<SortMode> sortMode = sgGeneral.add(new EnumSetting.Builder<SortMode>()
         .name("sort-mode")
         .description("How the action queues are prioritized.")
@@ -118,7 +143,67 @@ public class OptimizedNuker extends Module {
 
     private final Setting<Boolean> limitToMetaRegion = sgMeta.add(new BoolSetting.Builder().name("limit-to-meta-region").description("Restrict actions to the selected MiniHUD meta regions.").defaultValue(false).build());
     private final Setting<Boolean> invertMetaRegion = sgMeta.add(new BoolSetting.Builder().name("invert-meta-region").description("Treat the selected MiniHUD meta region union as outside-in: invalidate actions inside it and use the exterior shell for line placement.").defaultValue(false).build());
-    private final Setting<Boolean> debugMetaRegion = sgMeta.add(new BoolSetting.Builder().name("debug-meta-region").description("Log MiniHUD meta-region gating decisions to the server log.").defaultValue(false).build());
+    private final Setting<Boolean> debug = sgMeta.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Log MiniHUD meta-region decisions and play a ding when max successful actions are reached.")
+        .defaultValue(false)
+        .build()
+    );
+    private final Setting<Boolean> debugProfiling = sgMeta.add(new BoolSetting.Builder()
+        .name("debug-profiling")
+        .description("Collect and print tick performance scoreboards while debug is enabled.")
+        .defaultValue(false)
+        .visible(debug::get)
+        .build()
+    );
+    private final Setting<Boolean> debugProfileLogOutput = sgMeta.add(new BoolSetting.Builder()
+        .name("debug-profile-log-output")
+        .description("Print profiling scoreboards to the log.")
+        .defaultValue(true)
+        .visible(() -> debug.get() && debugProfiling.get())
+        .build()
+    );
+    private final Setting<Boolean> debugProfileChatOutput = sgMeta.add(new BoolSetting.Builder()
+        .name("debug-profile-chat-output")
+        .description("Print profiling scoreboards in chat.")
+        .defaultValue(true)
+        .visible(() -> debug.get() && debugProfiling.get())
+        .build()
+    );
+    private final Setting<Boolean> debugProfileHudOutput = sgMeta.add(new BoolSetting.Builder()
+        .name("debug-profile-hud-output")
+        .description("Render the live profiling scoreboard on screen.")
+        .defaultValue(true)
+        .visible(() -> debug.get() && debugProfiling.get())
+        .build()
+    );
+    private final Setting<Integer> debugProfileHudX = sgMeta.add(new IntSetting.Builder()
+        .name("debug-profile-hud-x")
+        .description("X position for the live profiling scoreboard.")
+        .defaultValue(8)
+        .min(0)
+        .sliderRange(0, 600)
+        .visible(() -> debug.get() && debugProfiling.get() && debugProfileHudOutput.get())
+        .build()
+    );
+    private final Setting<Integer> debugProfileHudY = sgMeta.add(new IntSetting.Builder()
+        .name("debug-profile-hud-y")
+        .description("Y position for the live profiling scoreboard.")
+        .defaultValue(8)
+        .min(0)
+        .sliderRange(0, 400)
+        .visible(() -> debug.get() && debugProfiling.get() && debugProfileHudOutput.get())
+        .build()
+    );
+    private final Setting<Integer> debugTickWindow = sgMeta.add(new IntSetting.Builder()
+        .name("debug-tick-window")
+        .description("Number of active ticks to aggregate before printing a debug performance scoreboard.")
+        .defaultValue(100)
+        .min(1)
+        .sliderRange(1, 400)
+        .visible(() -> debug.get() && debugProfiling.get())
+        .build()
+    );
     private final Setting<String> selectedMetaShapes = sgMeta.add(new StringSetting.Builder().name("selected-meta-shapes-internal").description("Internal persisted list of selected MiniHUD meta shapes.").defaultValue("").visible(() -> false).build());
     private final Setting<Integer> minHeight = sgMeta.add(new IntSetting.Builder().name("min-height").description("Minimum Y coordinate allowed for queued actions.").defaultValue(-64).sliderRange(-128, 384).build());
     private final Setting<Integer> maxHeight = sgMeta.add(new IntSetting.Builder().name("max-height").description("Maximum Y coordinate allowed for queued actions.").defaultValue(320).sliderRange(-128, 384).build());
@@ -138,19 +223,31 @@ public class OptimizedNuker extends Module {
     private final Setting<Boolean> airPlaceShell = sgPlacement.add(new BoolSetting.Builder().name("air-place-shell").description("Allow shell placement without a supporting face.").defaultValue(true).visible(lineWithBlocks::get).build());
 
     private final Setting<Boolean> swing = sgRender.add(new BoolSetting.Builder().name("swing").description("Render a swing client-side.").defaultValue(true).build());
-    private final Setting<Boolean> renderQueued = sgRender.add(new BoolSetting.Builder().name("render-queued").description("Render the front action from the crawl, local and full queues.").defaultValue(true).build());
+    private final Setting<Boolean> renderQueued = sgRender.add(new BoolSetting.Builder().name("render-queued").description("Render the next queued crawl action.").defaultValue(true).build());
     private final Setting<ShapeMode> renderShapeMode = sgRender.add(new EnumSetting.Builder<ShapeMode>().name("shape-mode").description("How queued action boxes are rendered.").defaultValue(ShapeMode.Both).visible(renderQueued::get).build());
     private final Setting<SettingColor> sideColor = sgRender.add(new ColorSetting.Builder().name("side-color").description("Side color for queued action rendering.").defaultValue(new SettingColor(255, 0, 0, 60)).visible(renderQueued::get).build());
     private final Setting<SettingColor> lineColor = sgRender.add(new ColorSetting.Builder().name("line-color").description("Line color for queued action rendering.").defaultValue(new SettingColor(255, 0, 0, 255)).visible(renderQueued::get).build());
 
     private final NukerMapCache mapCache = new NukerMapCache();
     private final NukerRuntime runtime = new NukerRuntime();
+    private final NukerProfiler profiler = new NukerProfiler(LOG);
+
+    // All allocated once, reused every tick.
     private final BlockPos.Mutable scanPos = new BlockPos.Mutable();
     private final BlockPos.Mutable metaNeighborPos = new BlockPos.Mutable();
-    private ScanContext scanContext = ScanContext.EMPTY;
+    private final BlockPos.Mutable executePos = new BlockPos.Mutable();
+    private final CandidatePolicy.Inputs inputs = new CandidatePolicy.Inputs();
+    private final ScanContext scanContext = new ScanContext();
+
     private final MiniHudSelectionState selectionState = new MiniHudSelectionState();
     private int metaDebugBudget;
-    private String lastMetaDebugSummary = "";
+
+    // Component-wise cache for the meta-debug summary so we only format on actual change.
+    private int lastMetaSelected = -1;
+    private boolean lastMetaHasSelected;
+    private boolean lastMetaUseLimit;
+    private boolean lastMetaInvert;
+    private int lastMetaRegionsSignature = -1;
 
     private static final List<Block> QUICK_BLACKLIST = Arrays.asList(
         Blocks.CHEST, Blocks.TRAPPED_CHEST, Blocks.BARREL, Blocks.ENDER_CHEST, Blocks.SHULKER_BOX,
@@ -166,34 +263,43 @@ public class OptimizedNuker extends Module {
     );
 
     public OptimizedNuker() {
-        super(Categories.World, "optimized-nuker", "Map-driven nuker with crawl, local and full scanners.");
+        super(Categories.World, "optimized-nuker", "Map-driven nuker with crawl, completion, and full-scan scanners.");
     }
 
     @Override
     public void onActivate() {
-        runtime.workSet.ensureQueueCapacities(maxActionsPerTick.get(), maxFullQueueSize.get());
+        runtime.workSet.ensureQueueCapacities(maxActionsPerTick.get());
         resetRuntimeState();
+        // HUD persisted whatever it was showing while the module was off; clear it now
+        // so we don't mix new ticks with stale historical numbers.
+        profiler.onModuleReactivate();
         metaDebugBudget = META_DEBUG_BUDGET_PER_TICK;
 
         if (mc.player == null || mc.world == null) return;
 
         reloadMetaShapeDraftFromSetting();
         refreshMap(true);
-        runtime.positionAtLastMovement = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
-        runtime.lastTickBestActionWorld = mc.player.getBlockPos();
-        scanContext = buildScanContext();
-        resetScannerCursors();
+        // Initial context build: no rebase, just capture the position and request
+        // the completion probe to find the initial frontier.
+        buildContext(/*forceRebase*/ false);
+        runtime.requestCompletionProbe(mapCache.candidateCount());
     }
 
     @Override
     public void onDeactivate() {
         resetRuntimeState();
+        // HUD intentionally left alone: it shows the last captured state until re-activate.
     }
 
     private void resetRuntimeState() {
         runtime.reset();
-        scanContext = ScanContext.EMPTY;
-        lastMetaDebugSummary = "";
+        scanContext.clear();
+        invalidateMetaSummary();
+    }
+
+    private void invalidateMetaSummary() {
+        lastMetaSelected = -1;
+        lastMetaRegionsSignature = -1;
     }
 
     @Override
@@ -265,50 +371,234 @@ public class OptimizedNuker extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
 
-        runtime.workSet.ensureQueueCapacities(maxActionsPerTick.get(), maxFullQueueSize.get());
-        metaDebugBudget = META_DEBUG_BUDGET_PER_TICK;
-        refreshMap(false);
-        scanContext = buildScanContext();
-        logMetaContextIfChanged();
-        CandidatePolicy.Inputs policy = buildCandidateInputs();
-
-        Vec3d now = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
-        int movementBlocks = runtime.computeMovementBlocks(now);
-        if (movementBlocks > 0) {
-            handleMovement(now, movementBlocks);
-            localScan(movementBlocks, policy);
-        }
+        boolean profileTick = debug.get() && debugProfiling.get();
+        if (profileTick) profiler.beginTick(debugTickWindow.get(), runtime.workSet.queuedActionCount(), runtime.frontierIndex, runtime.crawlAnchorIndex);
 
         if (runtime.timer > 0) {
             runtime.timer--;
-        } else {
-            int successes = modifyBlocks(policy);
-            if (successes >= maxActionsPerTick.get()) return;
+            if (profileTick) profiler.cancelTick();
+            return;
         }
 
-        if (!runtime.workSet.crawl.isFull()) crawlScan(policy);
-        if (!runtime.workSet.full.isFull()) fullScan(policy);
+        runtime.workSet.ensureQueueCapacities(maxActionsPerTick.get());
+        metaDebugBudget = META_DEBUG_BUDGET_PER_TICK;
+
+        long obsStart = profiler.beginPhase();
+        observe();
+        profiler.endPhase(NukerProfiler.Phase.OBSERVE, obsStart);
+
+        // Influencing scanners run once at the top of the tick, BEFORE crawl,
+        // because they can move the frontier and re-arm crawl. Crawl is the
+        // only action producer; everything else exists to keep crawl on target.
+        long scanStart = profiler.beginPhase();
+        runInfluencingScanners();
+        profiler.endPhase(NukerProfiler.Phase.SCAN, scanStart);
+
+        int actionGoal = Math.max(1, maxActionsPerTick.get());
+        profiler.recordActionGoal(actionGoal);
+        int totalSuccesses = runActionLoop(actionGoal);
+
+        finishActionTick(totalSuccesses, actionGoal);
+        runtime.workSet.clearQueues();
+        if (profileTick) endProfileTick(totalSuccesses);
+    }
+
+    /**
+     * Run the scanners that can affect crawl's frontier. Completion probe and full
+     * scan are mutually exclusive: completion runs when scheduled (activation, map
+     * rebuild, meta change) and resets full scan state so full starts fresh after.
+     * Full scan runs every other tick as a constant hum.
+     */
+    private void runInfluencingScanners() {
+        if (runtime.completionProbePending) {
+            long t = profiler.beginScanner();
+            try {
+                NukerScanners.runCompletionProbeIfPending(this, inputs, mapCache, runtime, scanPos, metaNeighborPos);
+            } finally {
+                profiler.endScanner(NukerProfiler.Scanner.COMPLETION, t);
+            }
+            // Completion probe resets full scan state so full starts fresh next tick.
+            runtime.globalFrontierProbeCursor = 0;
+            runtime.fullScanLowestSeen = -1;
+            return;
+        }
+
+        int fullScanBudget = Math.max(0, probeGlobalFrontierScansPerTick.get())
+            + Math.max(0, maxGlobalFrontierProbeScansPerTick.get() - probeGlobalFrontierScansPerTick.get());
+        if (fullScanBudget > 0) {
+            long t = profiler.beginScanner();
+            try {
+                NukerScanners.runFullScan(this, inputs, mapCache, runtime, scanPos, metaNeighborPos, fullScanBudget);
+            } finally {
+                profiler.endScanner(NukerProfiler.Scanner.FULL, t);
+            }
+        }
+    }
+
+    /**
+     * Crawl + modify loop. Crawl produces actions, modify consumes them. Exits
+     * when the action goal is met, when crawl yields (both cursors disabled),
+     * or when crawl produces no actions in a pass.
+     */
+    private int runActionLoop(int actionGoal) {
+        int totalSuccesses = 0;
+        int maxIterations = actionGoal + 4;
+
+        for (int iter = 0; iter < maxIterations && totalSuccesses < actionGoal; iter++) {
+            long crawlStart = profiler.beginScanner();
+            NukerScanners.runCrawl(this, inputs, mapCache, runtime, scanPos, metaNeighborPos,
+                CRAWL_MAX_SCANS_PER_CALL);
+            profiler.endScanner(NukerProfiler.Scanner.CRAWL, crawlStart);
+
+            if (!runtime.workSet.hasQueuedActions()) break;
+
+            long modStart = profiler.beginPhase();
+            totalSuccesses += runModify(actionGoal - totalSuccesses);
+            profiler.endPhase(NukerProfiler.Phase.MODIFY, modStart);
+        }
+
+        return totalSuccesses;
+    }
+
+    /**
+     * Observe phase. Detects context invalidation (block-border crossing or
+     * forced rebuild from map cache change) and dispatches the rebase. Within
+     * the same context, this method is a near-no-op.
+     */
+    private void observe() {
+        // Map rebuild is a context invalidator independent of player movement.
+        if (refreshMap(false)) {
+            buildContext(/*forceRebase*/ false);
+            return;
+        }
+
+        int blockX = mc.player.getBlockX();
+        int blockY = mc.player.getBlockY();
+        int blockZ = mc.player.getBlockZ();
+        if (runtime.hasCrossedBlockBorder(blockX, blockY, blockZ)) {
+            buildContext(/*forceRebase*/ true);
+        }
+    }
+
+    /**
+     * Build (or rebuild) the context: refresh scan context, repopulate {@link Inputs},
+     * capture context position, optionally run the rebase. Called on activation, on
+     * map cache change, and on integer-block-coord change.
+     *
+     * @param forceRebase true when the trigger was player movement; runs the rebase
+     *                    via {@link NukerScanners#runRebase}.
+     */
+    private void buildContext(boolean forceRebase) {
+        refreshScanContext();
+        populateInputs();
+        logMetaContextIfChanged();
+
+        Vec3d position = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        int blockX = mc.player.getBlockX();
+        int blockY = mc.player.getBlockY();
+        int blockZ = mc.player.getBlockZ();
+
+        if (forceRebase && mapCache.hasCandidates()) {
+            double distanceMoved = position.distanceTo(runtime.contextPosition);
+            int movementBlocks = Math.max(1, (int) Math.ceil(distanceMoved));
+
+            NukerScanners.runRebase(this, inputs, mapCache, runtime, scanPos, metaNeighborPos,
+                distanceMoved, shape.get(), sortMode.get());
+
+            // Full scan also responds to movement: regress its cursor and clear
+            // its memory so it freshly considers the close-side region.
+            NukerScanners.regressFullScanForMovement(mapCache, runtime, movementBlocks);
+        }
+
+        // Capture the new context. lastActionDistanceAtContextBuild measures the
+        // distance from THIS context's position to the current last-action world
+        // block, used at the NEXT context build to detect moved-toward vs away.
+        double lastActionDistance = runtime.frontierIsRealAction
+            ? position.distanceTo(new Vec3d(
+                runtime.lastActionWorldX + 0.5,
+                runtime.lastActionWorldY + 0.5,
+                runtime.lastActionWorldZ + 0.5))
+            : Double.NaN;
+
+        runtime.captureContext(position, blockX, blockY, blockZ, lastActionDistance);
+        runtime.workSet.clearQueues();
+    }
+
+    /**
+     * Drain the queue, executing one action per pop. On success, capture the
+     * world position so the next context build can do a coordinate-transform
+     * rebase if the player moves toward the same block.
+     */
+    private int runModify(int remainingGoal) {
+        int successes = 0;
+        int lastIndex = -1;
+        int lastWorldX = 0;
+        int lastWorldY = 0;
+        int lastWorldZ = 0;
+
+        while (successes < remainingGoal && runtime.workSet.popNextCrawlActionInto(runtime.workSet.actionView)) {
+            profiler.recordActionAttempt();
+            NukerActionQueue.View action = runtime.workSet.actionView;
+
+            boolean ok = action.type == CandidatePolicy.BREAK
+                ? performBreak(action)
+                : performPlace(action);
+
+            if (ok) {
+                profiler.recordActionDelivered();
+                lastIndex = action.mapIndex;
+                lastWorldX = action.pos.getX();
+                lastWorldY = action.pos.getY();
+                lastWorldZ = action.pos.getZ();
+                successes++;
+            } else {
+                profiler.recordActionFailed();
+            }
+        }
+
+        if (lastIndex >= 0) {
+            runtime.onActionSuccess(mapCache.clampToCandidateIndex(lastIndex), lastWorldX, lastWorldY, lastWorldZ);
+        }
+        return successes;
+    }
+
+    /**
+     * HUD render. Called from {@link dev.firstmage.optimizednuker.OptimizedNukerAddon}'s
+     * always-on Render2DEvent subscriber - NOT from the module's own event bus, so the
+     * HUD persists with its last-captured data while the module is deactivated, per the
+     * "hang how it got left, reset on re-enable" requirement.
+     */
+    public void renderProfilerHud(Render2DEvent event) {
+        if (!debug.get() || !debugProfiling.get() || !debugProfileHudOutput.get()) return;
+        if (mc.textRenderer == null) return;
+
+        List<String> lines = profiler.liveScoreboardLines();
+        if (lines.isEmpty()) return;
+
+        int x = Math.max(0, debugProfileHudX.get());
+        int y = Math.max(0, debugProfileHudY.get());
+        int lineHeight = mc.textRenderer.fontHeight + 2;
+        int width = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            int w = mc.textRenderer.getWidth(lines.get(i));
+            if (w > width) width = w;
+        }
+
+        event.drawContext.fill(x - 4, y - 4, x + width + 4, y + lineHeight * lines.size() + 2, 0x90000000);
+        int textY = y;
+        for (int i = 0; i < lines.size(); i++) {
+            event.drawContext.drawTextWithShadow(mc.textRenderer, lines.get(i), x, textY, 0xFFFFFFFF);
+            textY += lineHeight;
+        }
     }
 
     @EventHandler
     private void onRender(Render3DEvent event) {
         if (!renderQueued.get()) return;
-
-        boolean haveLocal = runtime.workSet.local.readFirstInto(runtime.workSet.localHeadView);
-        boolean haveCrawl = runtime.workSet.crawl.readFirstInto(runtime.workSet.crawlHeadView);
-        boolean haveFull = runtime.workSet.full.readFirstInto(runtime.workSet.fullHeadView);
-
-        if (haveLocal) renderActionHead(runtime.workSet.localHeadView.pos);
-        if (haveCrawl && (!haveLocal || runtime.workSet.crawlHeadView.posLong != runtime.workSet.localHeadView.posLong)) renderActionHead(runtime.workSet.crawlHeadView.pos);
-        if (haveFull
-            && (!haveLocal || runtime.workSet.fullHeadView.posLong != runtime.workSet.localHeadView.posLong)
-            && (!haveCrawl || runtime.workSet.fullHeadView.posLong != runtime.workSet.crawlHeadView.posLong)) {
-            renderActionHead(runtime.workSet.fullHeadView.pos);
+        if (runtime.workSet.peekNextCrawlActionInto(runtime.workSet.crawlHeadView)) {
+            RenderUtils.renderTickingBlock(runtime.workSet.crawlHeadView.pos,
+                sideColor.get(), lineColor.get(), renderShapeMode.get(), 0, 8, true, false);
         }
-    }
-
-    private void renderActionHead(BlockPos pos) {
-        RenderUtils.renderTickingBlock(pos, sideColor.get(), lineColor.get(), renderShapeMode.get(), 0, 8, true, false);
     }
 
     @EventHandler
@@ -321,257 +611,55 @@ public class OptimizedNuker extends Module {
         if (event.action == KeyAction.Press && selectBlockBind.get().matches(event.input)) addTargetedBlockToList();
     }
 
-    private void refreshMap(boolean force) {
-        if (mc.player == null || mc.world == null) return;
+    /**
+     * Refresh the candidate map cache. Returns true if the map was rebuilt (caller
+     * should rebuild the context). On rebuild, frontier is clamped, queues cleared,
+     * crawl invalidated, full scan cursor reset, and the completion probe scheduled
+     * to rediscover the initial frontier.
+     */
+    private boolean refreshMap(boolean force) {
+        if (mc.player == null || mc.world == null) return false;
 
-        int[] cubeExtents = currentCubeExtents();
-        boolean changed = mapCache.rebuildIfNeeded(force, shape.get(), sortMode.get(), range.get(), cubeExtents, mc.player.getHorizontalFacing());
-        if (!changed) return;
+        boolean changed = mapCache.rebuildIfNeeded(force, shape.get(), sortMode.get(), range.get(),
+            rangeUp.get(), rangeDown.get(), rangeLeft.get(), rangeRight.get(), rangeForward.get(), rangeBack.get(),
+            mc.player.getHorizontalFacing());
+        if (!changed) return false;
 
-        runtime.lastTickBestActionMapIndex = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
-        runtime.workSet.clearAll();
-        resetScannerCursors();
-    }
-
-    private void resetScannerCursors() {
-        int end = mapCache.candidateCount();
-        runtime.lastLocalCursorExclusive = end;
-        runtime.lastCrawlCursorExclusive = end;
-        runtime.restartFullScan(0);
-    }
-
-    private int[] currentCubeExtents() {
-        return new int[]{rangeUp.get(), rangeDown.get(), rangeLeft.get(), rangeRight.get(), rangeForward.get(), rangeBack.get()};
-    }
-
-    private void handleMovement(Vec3d now, int movementBlocks) {
-        runtime.positionAtLastMovement = now;
-        runtime.workSet.clearAll();
-        int rewind = countRewindIndicesForAnchor(runtime.fullScanCursor, movementBlocks);
-        runtime.restartFullScan(mapCache.clampToCandidateIndex(Math.max(0, runtime.fullScanCursor - rewind)));
-    }
-
-    private void localScan(int movementBlocks, CandidatePolicy.Inputs policy) {
-        runtime.workSet.local.clear();
-        if (!mapCache.hasCandidates()) {
-            runtime.lastLocalCursorExclusive = 0;
-            return;
-        }
-
-        int index = computeRetractedAnchorIndex(movementBlocks);
-        int goal = mapCache.candidateCount();
-        while (index < goal && !runtime.workSet.local.isFull()) {
-            scanQueueIndex(index, runtime.workSet.local, policy);
-            index++;
-        }
-        runtime.lastLocalCursorExclusive = clamp(index, 0, goal);
-    }
-
-    private void crawlScan(CandidatePolicy.Inputs policy) {
-        runtime.workSet.crawl.clear();
-        if (!mapCache.hasCandidates()) {
-            runtime.lastCrawlCursorExclusive = 0;
-            return;
-        }
-
-        int index = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
-        int goal = mapCache.candidateCount();
-        while (index < goal && !runtime.workSet.crawl.isFull()) {
-            scanQueueIndex(index, runtime.workSet.crawl, policy);
-            index++;
-        }
-        runtime.lastCrawlCursorExclusive = clamp(index, 0, goal);
-    }
-
-    private int computeLocalSearchBudget(int movementBlocks) {
-        if (!mapCache.hasCandidates()) return 0;
-        int rewind = countRewindIndicesForAnchor(runtime.lastTickBestActionMapIndex, movementBlocks);
-        int budget = Math.max(maxActionsPerTick.get(), rewind + maxActionsPerTick.get());
-        return clamp(budget, 1, mapCache.candidateCount());
-    }
-
-    private int computeRetractedAnchorIndex(int movementBlocks) {
-        int anchor = mapCache.clampToCandidateIndex(runtime.lastTickBestActionMapIndex);
-        int rewind = countRewindIndicesForAnchor(anchor, movementBlocks);
-        int retracted = anchor - rewind;
-        int budget = computeLocalSearchBudget(movementBlocks);
-        int minAllowed = Math.max(0, anchor - budget);
-        return clamp(retracted, minAllowed, anchor);
-    }
-
-    private int countRewindIndicesForAnchor(int anchorIndex, int movementBlocks) {
-        if (!mapCache.hasCandidates()) return 0;
-
-        int blocks = Math.max(1, movementBlocks);
-        if (shape.get() == Shape.Sphere) {
-            int clampedIndex = mapCache.clampToCandidateIndex(anchorIndex);
-            int anchorShell = clamp((int) Math.floor(mapCache.pointAt(clampedIndex).distance), 0, SphereMapStore.MAX_RADIUS);
-            int otherShell = sortMode.get() == SortMode.Furthest
-                ? clamp(anchorShell + blocks, 0, SphereMapStore.MAX_RADIUS)
-                : clamp(anchorShell - blocks, 0, SphereMapStore.MAX_RADIUS);
-            return Math.max(1, SphereMapStore.voxelsBetweenIntegerDistances(otherShell, anchorShell));
-        }
-
-        return Math.max(1, blocks * 64);
-    }
-
-    private int computeFullWrapExclusive() {
-        int wrapExclusive = Math.max(runtime.lastLocalCursorExclusive, runtime.lastCrawlCursorExclusive);
-        int maxExclusive = mapCache.candidateCount();
-        if (wrapExclusive <= 0) wrapExclusive = maxExclusive;
-        return clamp(wrapExclusive, 0, maxExclusive);
-    }
-
-    private void fullScan(CandidatePolicy.Inputs policy) {
-        if (!mapCache.hasCandidates()) return;
-        if (runtime.workSet.full.isFull()) return;
-
-        int wrapExclusive = computeFullWrapExclusive();
-        if (wrapExclusive <= 0) return;
-
-        int checksRemaining = runtime.fullScanJustReset ? Math.max(fullScanScansPerTick.get(), maxFullScanScansPerTick.get()) : fullScanScansPerTick.get();
-        boolean justReset = runtime.fullScanJustReset;
-        runtime.fullScanJustReset = false;
-
-        if (justReset && shouldUsePriorityBootstrapSearch()) {
-            checksRemaining = priorityBootstrapScan(policy, checksRemaining, wrapExclusive);
-        }
-
-        while (checksRemaining > 0 && !runtime.workSet.full.isFull()) {
-            int scanIndex = nextFullScanIndex(wrapExclusive);
-            if (scanIndex < 0) return;
-
-            scanQueueIndex(scanIndex, runtime.workSet.full, policy);
-            runtime.fullScanCursor = scanIndex + 1;
-            checksRemaining--;
-        }
-    }
-
-    private int nextFullScanIndex(int wrapExclusive) {
-        int scanIndex = runtime.fullScanCursor;
-        if (0 <= scanIndex && scanIndex < wrapExclusive) return scanIndex;
-        return wrapExclusive > 0 ? 0 : -1;
-    }
-
-    private boolean shouldUsePriorityBootstrapSearch() {
-        return shape.get() == Shape.Sphere && (sortMode.get() == SortMode.Closest || sortMode.get() == SortMode.Furthest);
-    }
-
-    private int priorityBootstrapScan(CandidatePolicy.Inputs policy, int checksRemaining, int wrapExclusive) {
-        int start = 0;
-        int upperExclusive = Math.min(wrapExclusive, mapCache.candidateCount());
-        if (upperExclusive <= 0 || checksRemaining <= 0) return checksRemaining;
-        while (checksRemaining > 0 && !runtime.workSet.full.isFull()) {
-            int span = upperExclusive - start;
-            if (span <= Math.max(5, maxActionsPerTick.get())) break;
-
-            int stride = smallestWrapAlignedStepAboveTenPercent(span);
-            boolean found = false;
-            int scansThisPass = Math.min(span, checksRemaining);
-
-            for (int phase = 0; phase < scansThisPass && !runtime.workSet.full.isFull(); phase++) {
-                int candidate = start + (int) (((long) phase * stride) % span);
-                if (candidate >= upperExclusive) continue;
-
-                checksRemaining--;
-                if (scanQueueIndex(candidate, runtime.workSet.full, policy)) {
-                    upperExclusive = candidate + 1;
-                    runtime.fullScanCursor = start;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) break;
-        }
-
-        return checksRemaining;
+        runtime.frontierIndex = mapCache.clampToCandidateIndex(runtime.frontierIndex);
+        runtime.frontierIsRealAction = false;
+        runtime.workSet.clearQueues();
+        runtime.invalidateCrawl();
+        runtime.globalFrontierProbeCursor = 0;
+        runtime.fullScanLowestSeen = -1;
+        runtime.requestCompletionProbe(mapCache.candidateCount());
+        return true;
     }
 
     /**
-     * Pick a modular stride for a bounded priority window of span candidates.
-     *
-     * The stride is a factor of the highest relative index, span - 1, not just
-     * a generic coprime step. That guarantees the first outward run reaches
-     * span - 1; after that wrap, the next relative index is stride - 1, so
-     * each wrap begins one index earlier while preserving full coverage over
-     * the window.
+     * Execute a queued break action. Always returns true: the underlying
+     * {@code BlockUtils.breakBlock}/packet-mine paths don't report success, so we
+     * count the attempt as delivered and let world state drive the next tick. If
+     * the block was unbreakable for some reason missed at classify time, the same
+     * candidate will simply be re-classified on the next tick.
      */
-    private static int smallestWrapAlignedStepAboveTenPercent(int span) {
-        if (span <= 2) return 1;
-
-        int lastRelativeIndex = span - 1;
-        int threshold = Math.max(1, lastRelativeIndex / 10);
-        for (int step = threshold + 1; step <= lastRelativeIndex; step++) {
-            if (lastRelativeIndex % step == 0) return step;
-        }
-
-        return lastRelativeIndex;
-    }
-
-    private int modifyBlocks(CandidatePolicy.Inputs policy) {
-        int successes = 0;
-        int bestMapIndex = Integer.MAX_VALUE;
-        long bestPosLong = 0L;
-        float bestDistance = 0F;
-        boolean haveBest = false;
-
-        while (successes < maxActionsPerTick.get() && runtime.workSet.popNextByPriorityInto(runtime.workSet.actionView)) {
-            if (!tryExecuteQueuedAction(runtime.workSet.actionView, policy)) continue;
-
-            if (!haveBest || runtime.workSet.actionView.mapIndex < bestMapIndex) {
-                bestMapIndex = runtime.workSet.actionView.mapIndex;
-                bestPosLong = runtime.workSet.actionView.posLong;
-                bestDistance = runtime.workSet.actionView.distance;
-                haveBest = true;
-            }
-
-            successes++;
-        }
-
-        if (haveBest) {
-            runtime.lastTickBestActionWorld = BlockPos.fromLong(bestPosLong);
-            runtime.lastTickBestActionMapIndex = bestMapIndex;
-            runtime.lastTickBestActionDistance = bestDistance;
-        }
-        if (successes > 0) runtime.timer = delay.get();
-        return successes;
-    }
-
-    private boolean tryExecuteQueuedAction(NukerActionQueue.View view, CandidatePolicy.Inputs policy) {
-        if (!mapCache.isCandidateIndex(view.mapIndex)) return false;
-        SphereMapStore.MapPoint point = mapCache.pointAt(view.mapIndex);
-        if (point == null) return false;
-        if (debugMetaRegion.get() && scanContext.hasSelectedShapes) {
-            boolean inside = scanContext.regions.contains(view.pos);
-            boolean shell = scanContext.regions.isShell(view.pos, metaNeighborPos);
-            boolean exterior = scanContext.regions.isExteriorBoundary(view.pos, metaNeighborPos);
-            debugMeta("EXEC try type={} pos={} idx={} inside={} shell={} exterior={} invert={} useLimit={}",
-                actionTypeName(view.type), view.pos.toShortString(), view.mapIndex, inside, shell, exterior, invertMetaRegion.get(), scanContext.useMetaRegionLimit);
-        }
-        if (!CandidatePolicy.revalidate(view.pos, point, view.type, policy, metaNeighborPos)) {
-            debugMeta("EXEC rejected type={} pos={} idx={} reason=revalidate_failed", actionTypeName(view.type), view.pos.toShortString(), view.mapIndex);
-            return false;
-        }
-        return view.type == CandidatePolicy.BREAK ? performBreak(view) : performPlace(view);
-    }
-
     private boolean performBreak(NukerActionQueue.View action) {
-        BlockPos targetPos = BlockPos.fromLong(action.posLong);
+        executePos.set(action.pos.getX(), action.pos.getY(), action.pos.getZ());
+        // The runnable captures executePos; safe because the runnable runs
+        // synchronously in this method before executePos is reused elsewhere.
         Runnable run = () -> {
             if (interact.get()) {
-                BlockUtils.interact(new BlockHitResult(targetPos.toCenterPos(), BlockUtils.getDirection(targetPos), targetPos, true), Hand.MAIN_HAND, swing.get());
+                BlockUtils.interact(new BlockHitResult(executePos.toCenterPos(), BlockUtils.getDirection(executePos), executePos, true), Hand.MAIN_HAND, swing.get());
             } else if (packetMine.get()) {
-                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, targetPos, BlockUtils.getDirection(targetPos)));
+                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
                 if (swing.get()) mc.player.swingHand(Hand.MAIN_HAND);
                 else mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
-                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, targetPos, BlockUtils.getDirection(targetPos)));
+                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
             } else {
-                BlockUtils.breakBlock(targetPos, swing.get());
+                BlockUtils.breakBlock(executePos, swing.get());
             }
         };
 
-        if (rotate.get()) Rotations.rotate(Rotations.getYaw(targetPos), Rotations.getPitch(targetPos), run);
+        if (rotate.get()) Rotations.rotate(Rotations.getYaw(executePos), Rotations.getPitch(executePos), run);
         else run.run();
         return true;
     }
@@ -581,24 +669,11 @@ public class OptimizedNuker extends Module {
         FindItemResult item = findPlacementBlock(allowed);
         if (!item.found()) return false;
 
-        BlockPos targetPos = BlockPos.fromLong(action.posLong);
+        executePos.set(action.pos.getX(), action.pos.getY(), action.pos.getZ());
         boolean airPlace = action.type == CandidatePolicy.PLACE_LINE && airPlaceShell.get();
-        Runnable run = () -> BlockUtils.place(targetPos, item, rotate.get(), 50, swing.get(), airPlace);
-        if (rotate.get()) Rotations.rotate(Rotations.getYaw(targetPos), Rotations.getPitch(targetPos), run);
+        Runnable run = () -> BlockUtils.place(executePos, item, rotate.get(), 50, swing.get(), airPlace);
+        if (rotate.get()) Rotations.rotate(Rotations.getYaw(executePos), Rotations.getPitch(executePos), run);
         else run.run();
-        return true;
-    }
-
-    private boolean scanQueueIndex(int mapIndex, NukerActionQueue queue, CandidatePolicy.Inputs policy) {
-        if (queue.isFull() || !mapCache.isCandidateIndex(mapIndex)) return false;
-
-        SphereMapStore.MapPoint point = mapCache.pointAt(mapIndex);
-        if (point == null) return false;
-        scanPos.set(mc.player.getX() + point.dx, mc.player.getY() + point.dy, mc.player.getZ() + point.dz);
-        byte type = CandidatePolicy.classify(scanPos, point, policy, metaNeighborPos);
-        if (type == CandidatePolicy.NONE) return false;
-
-        queue.insertSorted(scanPos.asLong(), mapIndex, point.distance, type);
         return true;
     }
 
@@ -606,20 +681,24 @@ public class OptimizedNuker extends Module {
         return InvUtils.findInHotbar(stack -> stack.getItem() instanceof BlockItem blockItem && allowed.contains(blockItem.getBlock()));
     }
 
-    private ScanContext buildScanContext() {
+    /** Repopulates the {@link #scanContext} singleton in place. */
+    private void refreshScanContext() {
         Set<String> selected = getNormalizedSelectedMetaShapeTokens();
         boolean needsMetaShapes = !selected.isEmpty() && (limitToMetaRegion.get() || lineWithBlocks.get());
         MiniHudRegionApi.Snapshot regions = needsMetaShapes ? MiniHudRegionApi.snapshot(selected) : MiniHudRegionApi.Snapshot.EMPTY;
 
-        boolean hasSelectedShapes = regions.hasRegions();
-        boolean useMetaRegionLimit = limitToMetaRegion.get() && hasSelectedShapes;
-        boolean linePlacementAvailable = lineWithBlocks.get() && hasSelectedShapes && !lineBlockList.get().isEmpty() && findPlacementBlock(lineBlockList.get()).found();
-        boolean liquidPlacementAvailable = liquidFiller.get() && !liquidFillBlocks.get().isEmpty() && findPlacementBlock(liquidFillBlocks.get()).found();
-        return new ScanContext(regions, hasSelectedShapes, useMetaRegionLimit, linePlacementAvailable, liquidPlacementAvailable);
+        scanContext.regions = regions;
+        scanContext.hasSelectedShapes = regions.hasRegions();
+        scanContext.useMetaRegionLimit = limitToMetaRegion.get() && scanContext.hasSelectedShapes;
+        scanContext.linePlacementAvailable = lineWithBlocks.get() && scanContext.hasSelectedShapes
+            && !lineBlockList.get().isEmpty() && findPlacementBlock(lineBlockList.get()).found();
+        scanContext.liquidPlacementAvailable = liquidFiller.get()
+            && !liquidFillBlocks.get().isEmpty() && findPlacementBlock(liquidFillBlocks.get()).found();
     }
 
-    private CandidatePolicy.Inputs buildCandidateInputs() {
-        return new CandidatePolicy.Inputs(
+    /** Repopulates the singleton {@link #inputs} record in place. No allocation. */
+    private void populateInputs() {
+        inputs.populate(
             mc.world,
             mc.player,
             shape.get(),
@@ -687,12 +766,18 @@ public class OptimizedNuker extends Module {
     private void applyMetaShapeDraft(GuiTheme theme, WTable table) {
         selectedMetaShapes.set(selectionState.draftSelectionString());
         MiniHudRegionApi.invalidateCache();
-        lastMetaDebugSummary = "";
+        invalidateMetaSummary();
 
         if (Utils.canUpdate()) {
-            scanContext = buildScanContext();
-            runtime.workSet.clearAll();
-            resetScannerCursors();
+            // Meta selection change invalidates the context: shape predicates change.
+            // Trigger a context rebuild without a movement rebase, then re-run the
+            // completion probe to rediscover the initial frontier.
+            buildContext(/*forceRebase*/ false);
+            runtime.frontierIsRealAction = false;
+            runtime.invalidateCrawl();
+            runtime.globalFrontierProbeCursor = 0;
+            runtime.fullScanLowestSeen = -1;
+            runtime.requestCompletionProbe(mapCache.candidateCount());
         }
 
         initWidget(theme, table);
@@ -710,6 +795,12 @@ public class OptimizedNuker extends Module {
         return selectionState.storedSelectionTokens(selectedMetaShapes.get());
     }
 
+    /**
+     * Returns the normalized stored token set, without writing it back to the setting
+     * on every tick. The original code did a {@code selectedMetaShapes.set(...)} write
+     * here when the canonical form differed from the stored form; that has been moved
+     * to {@link #applyMetaShapeDraft} so the per-tick path is read-only.
+     */
     private Set<String> getNormalizedSelectedMetaShapeTokens() {
         Set<String> stored = getSelectedMetaShapeTokens();
         if (stored.isEmpty()) return stored;
@@ -717,89 +808,91 @@ public class OptimizedNuker extends Module {
         List<MiniHudRegionApi.ShapeHandle> shapes = loadSortedMetaShapes();
         if (shapes.isEmpty()) return stored;
 
-        LinkedHashSet<String> normalized = selectionState.normalizedStoredSelection(selectedMetaShapes.get(), shapes);
-        String normalizedString = String.join("|", normalized);
-        if (!normalizedString.equals(selectedMetaShapes.get())) selectedMetaShapes.set(normalizedString);
-        return normalized;
+        return selectionState.normalizedStoredSelection(selectedMetaShapes.get(), shapes);
     }
 
     private void logMetaContextIfChanged() {
-        if (!debugMetaRegion.get()) return;
-        String summary = "selected=" + getSelectedMetaShapeTokens().size()
-            + " hasSelected=" + scanContext.hasSelectedShapes
-            + " useLimit=" + scanContext.useMetaRegionLimit
-            + " invert=" + invertMetaRegion.get()
-            + " summary=" + scanContext.regions.debugSummary();
-        if (!summary.equals(lastMetaDebugSummary)) {
-            lastMetaDebugSummary = summary;
-            debugMeta("CONTEXT {}", summary);
-        }
+        if (!debug.get()) return;
+
+        // Component-wise compare avoids building the summary string every tick.
+        int selected = getSelectedMetaShapeTokens().size();
+        int regionsSig = MiniHudRegionApi.rawShapeSignature();
+        boolean hasSelected = scanContext.hasSelectedShapes;
+        boolean useLimit = scanContext.useMetaRegionLimit;
+        boolean invert = invertMetaRegion.get();
+
+        if (selected == lastMetaSelected
+            && hasSelected == lastMetaHasSelected
+            && useLimit == lastMetaUseLimit
+            && invert == lastMetaInvert
+            && regionsSig == lastMetaRegionsSignature) return;
+
+        lastMetaSelected = selected;
+        lastMetaHasSelected = hasSelected;
+        lastMetaUseLimit = useLimit;
+        lastMetaInvert = invert;
+        lastMetaRegionsSignature = regionsSig;
+
+        debugMeta("CONTEXT selected={} hasSelected={} useLimit={} invert={} summary={}",
+            selected, hasSelected, useLimit, invert, scanContext.regions.debugSummary());
     }
 
     private void debugMeta(String message, Object... args) {
-        if (!debugMetaRegion.get() || metaDebugBudget <= 0) return;
+        if (!debug.get() || metaDebugBudget <= 0) return;
         metaDebugBudget--;
         LOG.info("[meta-debug] " + message, args);
     }
 
-    private static String actionTypeName(byte type) {
-        return switch (type) {
-            case CandidatePolicy.BREAK -> "BREAK";
-            case CandidatePolicy.PLACE_LINE -> "PLACE_LINE";
-            case CandidatePolicy.PLACE_LIQUID -> "PLACE_LIQUID";
-            default -> "NONE";
-        };
+    private void finishActionTick(int successes, int actionGoal) {
+        if (debug.get() && successes >= actionGoal && mc.player != null && mc.world != null) {
+            mc.world.playSound(null, mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.MASTER, 1.0f, 1.8f);
+        }
+        if (successes > 0) runtime.timer = delay.get();
     }
 
-    private static int clamp(int value, int min, int max) {
-        return Math.max(min, Math.min(max, value));
+    private void endProfileTick(int successes) {
+        profiler.endTick(successes, runtime.workSet.queuedActionCount(), runtime.frontierIndex,
+            runtime.crawlAnchorIndex, debugProfileLogOutput.get(), debugProfileChatOutput.get(),
+            this::info);
     }
 
-    public static int chebyshevDist(int x1, int y1, int z1, int x2, int y2, int z2) {
-        int dx = Math.abs(x2 - x1);
-        int dy = Math.abs(y2 - y1);
-        int dz = Math.abs(z2 - z1);
-        return Math.max(Math.max(dx, dy), dz);
+    /** Called from {@link NukerScanners} after each classify. Profiler-only; one indexed increment when active. */
+    void recordScan(NukerProfiler.Scanner scanner, byte classifyResult) {
+        profiler.recordScan(scanner, classifyResult != CandidatePolicy.NONE);
     }
 
-    public enum ListMode {
-        Whitelist,
-        Blacklist
+    /** Bridge for {@link NukerScanners} to wrap inner-dispatched probes (e.g. completion) in scanner timing. */
+    long beginScannerTimer() {
+        return profiler.beginScanner();
     }
 
-    public enum Mode {
-        All,
-        Flatten,
-        Smash
+    void endScannerTimer(NukerProfiler.Scanner scanner, long startNs) {
+        profiler.endScanner(scanner, startNs);
     }
 
-    public enum SortMode {
-        Closest,
-        Furthest,
-        TopDown
-    }
+    public enum ListMode { Whitelist, Blacklist }
+    public enum Mode { All, Flatten, Smash }
+    public enum SortMode { Closest, Furthest, TopDown }
+    public enum Shape { Cube, UniformCube, Sphere }
 
-    public enum Shape {
-        Cube,
-        UniformCube,
-        Sphere
-    }
-
+    /**
+     * Singleton-mutable per-tick context. Owned by {@link OptimizedNuker}; refilled
+     * once per tick from the active settings inside {@link #refreshScanContext}.
+     */
     private static final class ScanContext {
-        private static final ScanContext EMPTY = new ScanContext(MiniHudRegionApi.Snapshot.EMPTY, false, false, false, false);
+        MiniHudRegionApi.Snapshot regions = MiniHudRegionApi.Snapshot.EMPTY;
+        boolean hasSelectedShapes;
+        boolean useMetaRegionLimit;
+        boolean linePlacementAvailable;
+        boolean liquidPlacementAvailable;
 
-        private final MiniHudRegionApi.Snapshot regions;
-        private final boolean hasSelectedShapes;
-        private final boolean useMetaRegionLimit;
-        private final boolean linePlacementAvailable;
-        private final boolean liquidPlacementAvailable;
-
-        private ScanContext(MiniHudRegionApi.Snapshot regions, boolean hasSelectedShapes, boolean useMetaRegionLimit, boolean linePlacementAvailable, boolean liquidPlacementAvailable) {
-            this.regions = regions;
-            this.hasSelectedShapes = hasSelectedShapes;
-            this.useMetaRegionLimit = useMetaRegionLimit;
-            this.linePlacementAvailable = linePlacementAvailable;
-            this.liquidPlacementAvailable = liquidPlacementAvailable;
+        void clear() {
+            regions = MiniHudRegionApi.Snapshot.EMPTY;
+            hasSelectedShapes = false;
+            useMetaRegionLimit = false;
+            linePlacementAvailable = false;
+            liquidPlacementAvailable = false;
         }
     }
 }

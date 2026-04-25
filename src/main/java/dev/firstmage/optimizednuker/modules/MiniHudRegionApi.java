@@ -4,8 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.minecraft.util.math.BlockPos;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import net.minecraft.util.math.Direction;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -17,9 +16,6 @@ import java.util.Map;
 import java.util.Set;
 
 final class MiniHudRegionApi {
-    private static final Logger LOG = LogManager.getLogger("OptimizedNuker");
-    private static volatile boolean debugLogging;
-
     private static final Map<String, SnapshotCacheEntry> snapshotCache = new HashMap<>();
 
     private MiniHudRegionApi() {}
@@ -27,10 +23,6 @@ final class MiniHudRegionApi {
     static synchronized void invalidateCache() {
         MiniHudShapeCatalog.invalidateCache();
         snapshotCache.clear();
-    }
-
-    static void setDebugLogging(boolean enabled) {
-        debugLogging = enabled;
     }
 
     static synchronized List<ShapeHandle> listShapes() {
@@ -51,6 +43,11 @@ final class MiniHudRegionApi {
         return out;
     }
 
+    /** Returns the underlying raw cache signature, or 0 if unavailable. Used by callers to skip stale work. */
+    static synchronized int rawShapeSignature() {
+        return MiniHudShapeCatalog.refreshRawShapeCacheIfNeeded().signature;
+    }
+
     static synchronized Snapshot snapshot(Set<String> selectedTokens) {
         if (selectedTokens.isEmpty()) return Snapshot.EMPTY;
 
@@ -64,43 +61,17 @@ final class MiniHudRegionApi {
         }
 
         List<RegionEntry> regions = new ArrayList<>();
-        int matchedCount = 0;
         for (MiniHudShapeCatalog.RawShape raw : rawCache.shapes) {
-            boolean matched = raw.matchesAny(selectedTokens);
-            if (matched) matchedCount++;
-
-            if (debugLogging) {
-                LOG.info("[meta-debug] SHAPE name='{}' type={} enabled={} matched={} supported={} key={} build=SKIP",
-                    raw.displayName, raw.typeId, raw.enabled, matched, raw.supported, raw.selectionKey);
-            }
-
-            if (!matched) continue;
-            if (!raw.enabled) {
-                if (debugLogging) LOG.info("[meta-debug] SHAPE reject name='{}' reason=disabled", raw.displayName);
-                continue;
-            }
-            if (!raw.supported) {
-                if (debugLogging) LOG.info("[meta-debug] SHAPE reject name='{}' reason=unsupported supportReason={}", raw.displayName, raw.supportReason);
-                continue;
-            }
+            if (!raw.matchesAny(selectedTokens)) continue;
+            if (!raw.enabled) continue;
+            if (!raw.supported) continue;
 
             RegionDef region = buildRegion(raw.typeId, raw.json);
-            if (region == null) {
-                if (debugLogging) LOG.info("[meta-debug] SHAPE reject name='{}' reason=buildRegion_null json={}", raw.displayName, raw.json.toString());
-                continue;
-            }
+            if (region == null) continue;
 
             RegionEntry entry = new RegionEntry(raw.selectionKey, raw.displayName, raw.typeId, region);
-            if (entry.bounds.isEmpty()) {
-                if (debugLogging) LOG.info("[meta-debug] SHAPE reject name='{}' reason=empty_bounds", raw.displayName);
-                continue;
-            }
-            if (debugLogging) LOG.info("[meta-debug] SHAPE accept name='{}' bounds={}", raw.displayName, entry.bounds.debugString());
+            if (entry.bounds.isEmpty()) continue;
             regions.add(entry);
-        }
-
-        if (debugLogging) {
-            LOG.info("[meta-debug] SNAPSHOT selectedTokens={} rawShapes={} matched={} regionsBuilt={}", selectedTokens, rawCache.shapes.size(), matchedCount, regions.size());
         }
 
         Snapshot snapshot = regions.isEmpty() ? Snapshot.EMPTY : new Snapshot(regions);
@@ -118,9 +89,6 @@ final class MiniHudRegionApi {
         return String.join("\u001f", tokens);
     }
 
-
-
-
     private static RegionDef buildRegion(String typeId, JsonObject json) {
         String normalized = typeId.toLowerCase(Locale.ROOT);
         RegionDef base = switch (normalized) {
@@ -137,8 +105,6 @@ final class MiniHudRegionApi {
         LayerFilter layerFilter = LayerFilter.fromJson(getObject(json, "layers"));
         return layerFilter == null ? base : new LayeredRegion(base, layerFilter);
     }
-
-
 
     private static Vec3 parseVec3(JsonObject obj, String key) {
         if (obj == null || !obj.has(key)) return null;
@@ -203,8 +169,6 @@ final class MiniHudRegionApi {
         return center;
     }
 
-
-
     private static int toMinBlock(double minValue) {
         return (int) Math.ceil(minValue - 0.5);
     }
@@ -234,6 +198,7 @@ final class MiniHudRegionApi {
     static final class Snapshot {
         static final Snapshot EMPTY = new Snapshot(List.of());
         private static final int MAX_VOXEL_VOLUME = 4_000_000;
+        private static final Direction[] DIRECTIONS = Direction.values();
 
         private final List<RegionEntry> regions;
         private final IntBounds unionBounds;
@@ -281,7 +246,7 @@ final class MiniHudRegionApi {
 
         boolean isBoundary(int x, int y, int z, BlockPos.Mutable reusableNeighbor) {
             if (!contains(x, y, z)) return false;
-            for (net.minecraft.util.math.Direction direction : net.minecraft.util.math.Direction.values()) {
+            for (Direction direction : DIRECTIONS) {
                 reusableNeighbor.set(x + direction.getOffsetX(), y + direction.getOffsetY(), z + direction.getOffsetZ());
                 if (!contains(reusableNeighbor.getX(), reusableNeighbor.getY(), reusableNeighbor.getZ())) return true;
             }
@@ -294,15 +259,11 @@ final class MiniHudRegionApi {
 
         boolean isExteriorBoundary(int x, int y, int z, BlockPos.Mutable reusableNeighbor) {
             if (contains(x, y, z)) return false;
-            for (net.minecraft.util.math.Direction direction : net.minecraft.util.math.Direction.values()) {
+            for (Direction direction : DIRECTIONS) {
                 reusableNeighbor.set(x + direction.getOffsetX(), y + direction.getOffsetY(), z + direction.getOffsetZ());
                 if (contains(reusableNeighbor.getX(), reusableNeighbor.getY(), reusableNeighbor.getZ())) return true;
             }
             return false;
-        }
-
-        boolean isShell(BlockPos pos, BlockPos.Mutable reusableNeighbor) {
-            return isBoundary(pos, reusableNeighbor);
         }
 
         String debugSummary() {
@@ -383,7 +344,6 @@ final class MiniHudRegionApi {
         boolean contains(int x, int y, int z);
         IntBounds bounds();
     }
-
 
     private static final class SnapshotCacheEntry {
         final int rawSignature;
@@ -543,12 +503,6 @@ final class MiniHudRegionApi {
             if (minX > maxX || minY > maxY || minZ > maxZ) return EMPTY;
             return new IntBounds(minX, minY, minZ, maxX, maxY, maxZ);
         }
-
-        String debugString() {
-            return isEmpty()
-                ? "EMPTY"
-                : ("[" + minX + "," + minY + "," + minZ + "]..[" + maxX + "," + maxY + "," + maxZ + "]");
-        }
     }
 
     private static final class BlockySphereRegion implements RegionDef {
@@ -591,14 +545,12 @@ final class MiniHudRegionApi {
 
     private static final class SpawnSphereRegion implements RegionDef {
         private final Vec3 center;
-        private final double radius;
         private final double radiusSq;
         private final double margin;
         private final IntBounds bounds;
 
         private SpawnSphereRegion(Vec3 center, double radius, double margin) {
             this.center = center;
-            this.radius = radius;
             this.radiusSq = radius * radius;
             this.margin = margin;
             int padXZ = (int) Math.ceil(radius + margin) + 2;
