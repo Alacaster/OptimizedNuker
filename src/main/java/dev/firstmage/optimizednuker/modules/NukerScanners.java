@@ -165,6 +165,7 @@ final class NukerScanners {
         NukerRuntime runtime,
         BlockPos.Mutable scanPos,
         BlockPos.Mutable metaNeighborPos,
+        int actionGoal,
         int maxCrawlScans
     ) {
         if (!mapCache.hasCandidates()) {
@@ -172,23 +173,27 @@ final class NukerScanners {
             return true;
         }
 
-        if (runtime.crawlYielding()) return true;
-        if (runtime.workSet.queuesFull() || maxCrawlScans <= 0) return false;
+        if (runtime.workSet.queuedActionCount() >= actionGoal || maxCrawlScans <= 0) return false;
 
-        // Anchor at current frontier if not already anchored. Both cursors equal,
-        // disable flags cleared. The walk below interprets cursors thus:
-        //   low  inspects --crawlLowCursorExclusive  (so first inspection = anchor - 1)
-        //   high inspects crawlHighCursor++          (so first inspection = anchor)
+        // Re-anchor first: if the frontier moved (action success, scanner set, etc.)
+        // anchorCrawlAt resets cursors and clears disable flags. This MUST run before
+        // the yielding check below so a previously-yielded crawl can re-arm when its
+        // frontier advances.
         if (runtime.crawlAnchorIndex < 0
             || runtime.crawlAnchorIndex != mapCache.clampToCandidateIndex(runtime.frontierIndex)) {
             runtime.anchorCrawlAt(mapCache.clampToCandidateIndex(runtime.frontierIndex));
         }
 
+        // After potential re-anchor: if both cursors are still disabled, the frontier
+        // didn't move (no new work for crawl to walk to). Yield and let other scanners
+        // (full scan, completion probe, future block-update) discover work elsewhere.
+        if (runtime.crawlYielding()) return true;
+
         int candidateCount = mapCache.candidateCount();
         double rangeMax = inputs.range;
         int scans = 0;
 
-        while (!runtime.workSet.queuesFull()
+        while (runtime.workSet.queuedActionCount() < actionGoal
             && scans < maxCrawlScans
             && !runtime.crawlYielding()) {
 

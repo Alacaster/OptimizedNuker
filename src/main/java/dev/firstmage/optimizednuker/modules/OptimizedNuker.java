@@ -445,15 +445,16 @@ public class OptimizedNuker extends Module {
         int maxIterations = actionGoal + 4;
 
         for (int iter = 0; iter < maxIterations && totalSuccesses < actionGoal; iter++) {
+            int remainingGoal = actionGoal - totalSuccesses;
             long crawlStart = profiler.beginScanner();
             NukerScanners.runCrawl(this, inputs, mapCache, runtime, scanPos, metaNeighborPos,
-                CRAWL_MAX_SCANS_PER_CALL);
+                remainingGoal, CRAWL_MAX_SCANS_PER_CALL);
             profiler.endScanner(NukerProfiler.Scanner.CRAWL, crawlStart);
 
             if (!runtime.workSet.hasQueuedActions()) break;
 
             long modStart = profiler.beginPhase();
-            totalSuccesses += runModify(actionGoal - totalSuccesses);
+            totalSuccesses += runModify(remainingGoal);
             profiler.endPhase(NukerProfiler.Phase.MODIFY, modStart);
         }
 
@@ -525,9 +526,9 @@ public class OptimizedNuker extends Module {
     }
 
     /**
-     * Drain the queue, executing one action per pop. On success, capture the
-     * world position so the next context build can do a coordinate-transform
-     * rebase if the player moves toward the same block.
+     * Drain the queue, executing one action per pop. On success, capture the world
+     * position so the next context build can do a coordinate-transform rebase if
+     * the player moves toward the same block.
      */
     private int runModify(int remainingGoal) {
         int successes = 0;
@@ -853,7 +854,8 @@ public class OptimizedNuker extends Module {
 
     private void endProfileTick(int successes) {
         profiler.endTick(successes, runtime.workSet.queuedActionCount(), runtime.frontierIndex,
-            runtime.crawlAnchorIndex, debugProfileLogOutput.get(), debugProfileChatOutput.get(),
+            runtime.crawlAnchorIndex, runtime.frontierIsRealAction, runtime.crawlYielding(),
+            debugProfileLogOutput.get(), debugProfileChatOutput.get(),
             this::info);
     }
 
