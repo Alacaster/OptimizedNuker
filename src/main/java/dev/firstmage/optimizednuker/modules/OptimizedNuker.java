@@ -1,7 +1,7 @@
 package dev.firstmage.optimizednuker.modules;
 
 import meteordevelopment.meteorclient.events.entity.player.BlockBreakingCooldownEvent;
-import meteordevelopment.meteorclient.events.meteor.KeyEvent;
+import meteordevelopment.meteorclient.events.meteor.KeyInputEvent;
 import meteordevelopment.meteorclient.events.meteor.MouseClickEvent;
 import meteordevelopment.meteorclient.events.render.Render2DEvent;
 import meteordevelopment.meteorclient.events.render.Render3DEvent;
@@ -27,18 +27,18 @@ import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
-import net.minecraft.block.Block;
-import net.minecraft.block.Blocks;
-import net.minecraft.item.BlockItem;
-import net.minecraft.network.packet.c2s.play.HandSwingC2SPacket;
-import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
-import net.minecraft.sound.SoundCategory;
-import net.minecraft.sound.SoundEvents;
-import net.minecraft.util.Hand;
-import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.hit.HitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.network.protocol.game.ServerboundSwingPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -233,9 +233,9 @@ public class OptimizedNuker extends Module {
     private final NukerProfiler profiler = new NukerProfiler(LOG);
 
     // All allocated once, reused every tick.
-    private final BlockPos.Mutable scanPos = new BlockPos.Mutable();
-    private final BlockPos.Mutable metaNeighborPos = new BlockPos.Mutable();
-    private final BlockPos.Mutable executePos = new BlockPos.Mutable();
+    private final BlockPos.MutableBlockPos scanPos = new BlockPos.MutableBlockPos();
+    private final BlockPos.MutableBlockPos metaNeighborPos = new BlockPos.MutableBlockPos();
+    private final BlockPos.MutableBlockPos executePos = new BlockPos.MutableBlockPos();
     private final CandidatePolicy.Inputs inputs = new CandidatePolicy.Inputs();
     private final ScanContext scanContext = new ScanContext();
 
@@ -275,7 +275,7 @@ public class OptimizedNuker extends Module {
         profiler.onModuleReactivate();
         metaDebugBudget = META_DEBUG_BUDGET_PER_TICK;
 
-        if (mc.player == null || mc.world == null) return;
+        if (mc.player == null || mc.level == null) return;
 
         reloadMetaShapeDraftFromSetting();
         refreshMap(true);
@@ -369,7 +369,7 @@ public class OptimizedNuker extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
-        if (mc.player == null || mc.world == null) return;
+        if (mc.player == null || mc.level == null) return;
 
         boolean profileTick = debug.get() && debugProfiling.get();
         if (profileTick) profiler.beginTick(debugTickWindow.get(), runtime.workSet.queuedActionCount(), runtime.frontierIndex, runtime.crawlAnchorIndex);
@@ -473,9 +473,9 @@ public class OptimizedNuker extends Module {
             return;
         }
 
-        int blockX = mc.player.getBlockX();
-        int blockY = mc.player.getBlockY();
-        int blockZ = mc.player.getBlockZ();
+        int blockX = mc.player.blockPosition().getX();
+        int blockY = mc.player.blockPosition().getY();
+        int blockZ = mc.player.blockPosition().getZ();
         if (runtime.hasCrossedBlockBorder(blockX, blockY, blockZ)) {
             buildContext(/*forceRebase*/ true);
         }
@@ -494,10 +494,10 @@ public class OptimizedNuker extends Module {
         populateInputs();
         logMetaContextIfChanged();
 
-        Vec3d position = new Vec3d(mc.player.getX(), mc.player.getY(), mc.player.getZ());
-        int blockX = mc.player.getBlockX();
-        int blockY = mc.player.getBlockY();
-        int blockZ = mc.player.getBlockZ();
+        Vec3 position = new Vec3(mc.player.getX(), mc.player.getY(), mc.player.getZ());
+        int blockX = mc.player.blockPosition().getX();
+        int blockY = mc.player.blockPosition().getY();
+        int blockZ = mc.player.blockPosition().getZ();
 
         if (forceRebase && mapCache.hasCandidates()) {
             double distanceMoved = position.distanceTo(runtime.contextPosition);
@@ -515,7 +515,7 @@ public class OptimizedNuker extends Module {
         // distance from THIS context's position to the current last-action world
         // block, used at the NEXT context build to detect moved-toward vs away.
         double lastActionDistance = runtime.frontierIsRealAction
-            ? position.distanceTo(new Vec3d(
+            ? position.distanceTo(new Vec3(
                 runtime.lastActionWorldX + 0.5,
                 runtime.lastActionWorldY + 0.5,
                 runtime.lastActionWorldZ + 0.5))
@@ -571,24 +571,24 @@ public class OptimizedNuker extends Module {
      */
     public void renderProfilerHud(Render2DEvent event) {
         if (!debug.get() || !debugProfiling.get() || !debugProfileHudOutput.get()) return;
-        if (mc.textRenderer == null) return;
+        if (mc.font == null) return;
 
         List<String> lines = profiler.liveScoreboardLines();
         if (lines.isEmpty()) return;
 
         int x = Math.max(0, debugProfileHudX.get());
         int y = Math.max(0, debugProfileHudY.get());
-        int lineHeight = mc.textRenderer.fontHeight + 2;
+        int lineHeight = mc.font.lineHeight + 2;
         int width = 0;
         for (int i = 0; i < lines.size(); i++) {
-            int w = mc.textRenderer.getWidth(lines.get(i));
+            int w = mc.font.width(lines.get(i));
             if (w > width) width = w;
         }
 
-        event.drawContext.fill(x - 4, y - 4, x + width + 4, y + lineHeight * lines.size() + 2, 0x90000000);
+        event.graphics.fill(x - 4, y - 4, x + width + 4, y + lineHeight * lines.size() + 2, 0x90000000);
         int textY = y;
         for (int i = 0; i < lines.size(); i++) {
-            event.drawContext.drawTextWithShadow(mc.textRenderer, lines.get(i), x, textY, 0xFFFFFFFF);
+            event.graphics.text(mc.font, lines.get(i), x, textY, 0xFFFFFFFF, true);
             textY += lineHeight;
         }
     }
@@ -608,7 +608,7 @@ public class OptimizedNuker extends Module {
     }
 
     @EventHandler
-    private void onKey(KeyEvent event) {
+    private void onKey(KeyInputEvent event) {
         if (event.action == KeyAction.Press && selectBlockBind.get().matches(event.input)) addTargetedBlockToList();
     }
 
@@ -619,11 +619,11 @@ public class OptimizedNuker extends Module {
      * to rediscover the initial frontier.
      */
     private boolean refreshMap(boolean force) {
-        if (mc.player == null || mc.world == null) return false;
+        if (mc.player == null || mc.level == null) return false;
 
         boolean changed = mapCache.rebuildIfNeeded(force, shape.get(), sortMode.get(), range.get(),
             rangeUp.get(), rangeDown.get(), rangeLeft.get(), rangeRight.get(), rangeForward.get(), rangeBack.get(),
-            mc.player.getHorizontalFacing());
+            mc.player.getDirection());
         if (!changed) return false;
 
         runtime.frontierIndex = mapCache.clampToCandidateIndex(runtime.frontierIndex);
@@ -649,12 +649,12 @@ public class OptimizedNuker extends Module {
         // synchronously in this method before executePos is reused elsewhere.
         Runnable run = () -> {
             if (interact.get()) {
-                BlockUtils.interact(new BlockHitResult(executePos.toCenterPos(), BlockUtils.getDirection(executePos), executePos, true), Hand.MAIN_HAND, swing.get());
+                BlockUtils.interact(new BlockHitResult(executePos.getCenter(), BlockUtils.getDirection(executePos), executePos, true), InteractionHand.MAIN_HAND, swing.get());
             } else if (packetMine.get()) {
-                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.START_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
-                if (swing.get()) mc.player.swingHand(Hand.MAIN_HAND);
-                else mc.getNetworkHandler().sendPacket(new HandSwingC2SPacket(Hand.MAIN_HAND));
-                mc.getNetworkHandler().sendPacket(new PlayerActionC2SPacket(PlayerActionC2SPacket.Action.STOP_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
+                mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
+                if (swing.get()) mc.player.swing(InteractionHand.MAIN_HAND);
+                else mc.getConnection().send(new ServerboundSwingPacket(InteractionHand.MAIN_HAND));
+                mc.getConnection().send(new ServerboundPlayerActionPacket(ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK, executePos, BlockUtils.getDirection(executePos)));
             } else {
                 BlockUtils.breakBlock(executePos, swing.get());
             }
@@ -700,7 +700,7 @@ public class OptimizedNuker extends Module {
     /** Repopulates the singleton {@link #inputs} record in place. No allocation. */
     private void populateInputs() {
         inputs.populate(
-            mc.world,
+            mc.level,
             mc.player,
             shape.get(),
             mode.get(),
@@ -738,11 +738,11 @@ public class OptimizedNuker extends Module {
     }
 
     private void addTargetedBlockToList() {
-        if (mc.currentScreen != null || mc.crosshairTarget == null) return;
-        if (mc.crosshairTarget.getType() != HitResult.Type.BLOCK) return;
+        if (mc.screen != null || mc.hitResult == null) return;
+        if (mc.hitResult.getType() != HitResult.Type.BLOCK) return;
 
-        BlockPos pos = ((BlockHitResult) mc.crosshairTarget).getBlockPos();
-        Block block = mc.world.getBlockState(pos).getBlock();
+        BlockPos pos = ((BlockHitResult) mc.hitResult).getBlockPos();
+        Block block = mc.level.getBlockState(pos).getBlock();
         List<Block> list = listMode.get() == ListMode.Whitelist ? whitelist.get() : blacklist.get();
 
         if (list.contains(block)) {
@@ -845,9 +845,9 @@ public class OptimizedNuker extends Module {
     }
 
     private void finishActionTick(int successes, int actionGoal) {
-        if (debug.get() && successes >= actionGoal && mc.player != null && mc.world != null) {
-            mc.world.playSound(null, mc.player.getX(), mc.player.getY(), mc.player.getZ(),
-                SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, SoundCategory.MASTER, 1.0f, 1.8f);
+        if (debug.get() && successes >= actionGoal && mc.player != null && mc.level != null) {
+            mc.level.playSound(null, mc.player.getX(), mc.player.getY(), mc.player.getZ(),
+                SoundEvents.EXPERIENCE_ORB_PICKUP, SoundSource.MASTER, 1.0f, 1.8f);
         }
         if (successes > 0) runtime.timer = delay.get();
     }

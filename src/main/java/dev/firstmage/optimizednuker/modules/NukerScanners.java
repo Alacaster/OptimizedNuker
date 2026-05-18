@@ -1,6 +1,6 @@
 package dev.firstmage.optimizednuker.modules;
 
-import net.minecraft.util.math.BlockPos;
+import net.minecraft.core.BlockPos;
 
 /**
  * Pure scanner logic. Each function reads {@link CandidatePolicy.Inputs} and the
@@ -60,8 +60,8 @@ final class NukerScanners {
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
         NukerRuntime runtime,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos,
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos,
         double distanceMoved,
         OptimizedNuker.Shape shape,
         OptimizedNuker.SortMode sortMode
@@ -163,8 +163,8 @@ final class NukerScanners {
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
         NukerRuntime runtime,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos,
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos,
         int actionGoal,
         int maxCrawlScans
     ) {
@@ -264,8 +264,8 @@ final class NukerScanners {
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
         NukerRuntime runtime,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos,
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos,
         int budget
     ) {
         if (!mapCache.hasCandidates() || budget <= 0) return;
@@ -350,8 +350,8 @@ final class NukerScanners {
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
         NukerRuntime runtime,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos
     ) {
         if (!runtime.completionProbePending) return;
         runtime.completionProbePending = false;
@@ -413,8 +413,8 @@ final class NukerScanners {
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
         NukerActionQueue queue,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos,
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos,
         int mapIndex
     ) {
         if (queue.isFull()) return false;
@@ -434,8 +434,8 @@ final class NukerScanners {
         OptimizedNuker module,
         CandidatePolicy.Inputs inputs,
         NukerMapCache mapCache,
-        BlockPos.Mutable scanPos,
-        BlockPos.Mutable metaNeighborPos,
+        BlockPos.MutableBlockPos scanPos,
+        BlockPos.MutableBlockPos metaNeighborPos,
         int mapIndex,
         NukerProfiler.Scanner scanner
     ) {

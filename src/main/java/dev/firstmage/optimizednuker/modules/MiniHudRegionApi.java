@@ -3,8 +3,8 @@ package dev.firstmage.optimizednuker.modules;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -240,27 +240,27 @@ final class MiniHudRegionApi {
             return containsAnalytic(x, y, z);
         }
 
-        boolean isBoundary(BlockPos pos, BlockPos.Mutable reusableNeighbor) {
+        boolean isBoundary(BlockPos pos, BlockPos.MutableBlockPos reusableNeighbor) {
             return isBoundary(pos.getX(), pos.getY(), pos.getZ(), reusableNeighbor);
         }
 
-        boolean isBoundary(int x, int y, int z, BlockPos.Mutable reusableNeighbor) {
+        boolean isBoundary(int x, int y, int z, BlockPos.MutableBlockPos reusableNeighbor) {
             if (!contains(x, y, z)) return false;
             for (Direction direction : DIRECTIONS) {
-                reusableNeighbor.set(x + direction.getOffsetX(), y + direction.getOffsetY(), z + direction.getOffsetZ());
+                reusableNeighbor.set(x + direction.getStepX(), y + direction.getStepY(), z + direction.getStepZ());
                 if (!contains(reusableNeighbor.getX(), reusableNeighbor.getY(), reusableNeighbor.getZ())) return true;
             }
             return false;
         }
 
-        boolean isExteriorBoundary(BlockPos pos, BlockPos.Mutable reusableNeighbor) {
+        boolean isExteriorBoundary(BlockPos pos, BlockPos.MutableBlockPos reusableNeighbor) {
             return isExteriorBoundary(pos.getX(), pos.getY(), pos.getZ(), reusableNeighbor);
         }
 
-        boolean isExteriorBoundary(int x, int y, int z, BlockPos.Mutable reusableNeighbor) {
+        boolean isExteriorBoundary(int x, int y, int z, BlockPos.MutableBlockPos reusableNeighbor) {
             if (contains(x, y, z)) return false;
             for (Direction direction : DIRECTIONS) {
-                reusableNeighbor.set(x + direction.getOffsetX(), y + direction.getOffsetY(), z + direction.getOffsetZ());
+                reusableNeighbor.set(x + direction.getStepX(), y + direction.getStepY(), z + direction.getStepZ());
                 if (contains(reusableNeighbor.getX(), reusableNeighbor.getY(), reusableNeighbor.getZ())) return true;
             }
             return false;

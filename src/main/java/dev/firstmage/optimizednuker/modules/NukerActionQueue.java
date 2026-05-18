@@ -1,6 +1,6 @@
 package dev.firstmage.optimizednuker.modules;
 
-import net.minecraft.util.math.BlockPos;
+import net.minecraft.core.BlockPos;
 
 /**
  * Fixed-size primitive storage for crawl candidates.
@@ -105,7 +105,7 @@ final class NukerActionQueue {
     }
 
     static final class View {
-        final BlockPos.Mutable pos = new BlockPos.Mutable();
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         long posLong;
         int mapIndex;
         float distance;

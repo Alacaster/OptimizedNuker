@@ -1,6 +1,6 @@
 package dev.firstmage.optimizednuker.modules;
 
-import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * Per-module mutable state. State is partitioned by lifetime:
@@ -57,7 +57,7 @@ final class NukerRuntime {
 
     // ---- context -------------------------------------------------------------
 
-    Vec3d contextPosition = Vec3d.ZERO;
+    Vec3 contextPosition = Vec3.ZERO;
     int contextBlockX;
     int contextBlockY;
     int contextBlockZ;
@@ -87,7 +87,7 @@ final class NukerRuntime {
         completionProbePending = false;
         globalFrontierProbeCursor = 0;
         fullScanLowestSeen = -1;
-        contextPosition = Vec3d.ZERO;
+        contextPosition = Vec3.ZERO;
         contextBlockX = 0;
         contextBlockY = 0;
         contextBlockZ = 0;
@@ -156,7 +156,7 @@ final class NukerRuntime {
     }
 
     /** Capture context state at the start of a context build. */
-    void captureContext(Vec3d position, int blockX, int blockY, int blockZ, double lastActionDistance) {
+    void captureContext(Vec3 position, int blockX, int blockY, int blockZ, double lastActionDistance) {
         contextPosition = position;
         contextBlockX = blockX;
         contextBlockY = blockY;

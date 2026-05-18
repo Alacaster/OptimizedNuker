@@ -1,14 +1,14 @@
 package dev.firstmage.optimizednuker.modules;
 
 import meteordevelopment.meteorclient.utils.world.BlockUtils;
-import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
-import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
-import net.minecraft.world.RaycastContext;
-import net.minecraft.world.World;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
 
 import java.util.HashSet;
 import java.util.List;
@@ -27,7 +27,7 @@ final class CandidatePolicy {
 
     private CandidatePolicy() {}
 
-    static byte classify(BlockPos pos, SphereMapStore.MapPoint point, Inputs in, BlockPos.Mutable reusableNeighbor) {
+    static byte classify(BlockPos pos, SphereMapStore.MapPoint point, Inputs in, BlockPos.MutableBlockPos reusableNeighbor) {
         if (pos.getY() < in.minHeight || pos.getY() > in.maxHeight) return NONE;
         if (!passesShapeRules(pos, in)) return NONE;
         if (in.useMetaRegionLimit) {
@@ -70,8 +70,8 @@ final class CandidatePolicy {
         if (in.listMode == OptimizedNuker.ListMode.Whitelist
             ? !in.whitelistSet.contains(state.getBlock())
             : in.blacklistSet.contains(state.getBlock())) return NONE;
-        if (in.mode == OptimizedNuker.Mode.Smash && state.getHardness(in.world, pos) != 0) return NONE;
-        if (in.suitableTools && !in.interact && !in.player.getMainHandStack().isSuitableFor(state)) return NONE;
+        if (in.mode == OptimizedNuker.Mode.Smash && state.getDestroySpeed(in.world, pos) != 0) return NONE;
+        if (in.suitableTools && !in.interact && !in.player.getMainHandItem().isCorrectToolForDrops(state)) return NONE;
         if (!in.interact && !BlockUtils.canBreak(pos, state)) return NONE;
         if (isOutOfRange(pos, in)) return NONE;
         return BREAK;
@@ -132,12 +132,12 @@ final class CandidatePolicy {
         double distSq = edx * edx + edy * edy + edz * edz;
         if (distSq <= in.wallsRangeSq) return false;
         // Beyond walls range: must raycast to confirm direct line of sight.
-        // Vec3d and RaycastContext allocate; only happens for opt-in raytracing past walls range.
-        Vec3d eye = new Vec3d(in.eyeX, in.eyeY, in.eyeZ);
-        Vec3d target = new Vec3d(cx, cy, cz);
-        RaycastContext context = new RaycastContext(eye, target,
-            RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, in.player);
-        BlockHitResult result = in.world.raycast(context);
+        // Vec3 and ClipContext allocate; only happens for opt-in raytracing past walls range.
+        Vec3 eye = new Vec3(in.eyeX, in.eyeY, in.eyeZ);
+        Vec3 target = new Vec3(cx, cy, cz);
+        ClipContext context = new ClipContext(eye, target,
+            ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, in.player);
+        BlockHitResult result = in.world.clip(context);
         return result == null || !result.getBlockPos().equals(blockPos);
     }
 
@@ -147,12 +147,12 @@ final class CandidatePolicy {
      * mirrored into HashSets for O(1) contains() in the classify hot path.
      */
     static final class Inputs {
-        World world;
-        ClientPlayerEntity player;
+        Level world;
+        LocalPlayer player;
         OptimizedNuker.Shape shape;
         OptimizedNuker.Mode mode;
         OptimizedNuker.ListMode listMode;
-        net.minecraft.util.math.Direction facing;
+        net.minecraft.core.Direction facing;
 
         // Player position cached to avoid per-candidate getX/getBlockX calls.
         int playerBlockX;
@@ -201,8 +201,8 @@ final class CandidatePolicy {
         double wallsRangeSq;
 
         void populate(
-            World world,
-            ClientPlayerEntity player,
+            Level world,
+            LocalPlayer player,
             OptimizedNuker.Shape shape,
             OptimizedNuker.Mode mode,
             OptimizedNuker.ListMode listMode,
@@ -241,15 +241,15 @@ final class CandidatePolicy {
             this.shape = shape;
             this.mode = mode;
             this.listMode = listMode;
-            this.facing = player.getHorizontalFacing();
-            this.playerBlockX = player.getBlockX();
-            this.playerBlockY = player.getBlockY();
-            this.playerBlockZ = player.getBlockZ();
+            this.facing = player.getDirection();
+            this.playerBlockX = player.blockPosition().getX();
+            this.playerBlockY = player.blockPosition().getY();
+            this.playerBlockZ = player.blockPosition().getZ();
             this.playerY = player.getY();
-            Vec3d eye = player.getEyePos();
-            this.eyeX = eye.x;
-            this.eyeY = eye.y;
-            this.eyeZ = eye.z;
+            Vec3 eye = player.getEyePosition();
+            this.eyeX = eye.x();
+            this.eyeY = eye.y();
+            this.eyeZ = eye.z();
             this.range = range;
             this.uniformCubeRadius = (int) Math.round(range);
             this.rangeUp = rangeUp;
